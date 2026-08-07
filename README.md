@@ -123,6 +123,7 @@ what you have lost.
 | --- | --- |
 | `P` ×5 | Toggle mouse control ON/OFF (**emergency disable**) — five taps within five seconds |
 | `ESC` | Quit immediately |
+| `F5` / `F6` | Invert the X / Y axis |
 | `F7` | Cycle how the controlling hand is chosen (rightmost → leftmost → handedness → any) |
 | `F9` | Cycle the palm anchor strategy (wrist → MCP centroid → palm centroid) |
 | `F10` | Reset the motion filter |
@@ -172,8 +173,13 @@ The preview is mirrored, so it reads like a mirror:
 - Move the case **right** → cursor moves **right**
 - Move the case **away from you** (toward the screen) → cursor moves **up**
 
-If either axis feels backwards on your setup, flip `invert_x` / `invert_y` in
-`config/config.json` rather than trying to relearn the motion.
+`invert_y` ships **enabled**, measured rather than derived: on the reference
+setup the raw camera-Y sign moved the cursor the opposite way to the hand, so
+the sign is flipped by default.
+
+If either axis feels backwards on your setup, press **F5** (X) or **F6** (Y) to
+flip it live — the HUD shows the current state — then write the setting you
+landed on into `config/config.json` to make it stick.
 
 ---
 

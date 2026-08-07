@@ -100,7 +100,12 @@ class CursorSettings:
     x_sensitivity: float = 1.0
     y_sensitivity: float = 1.0
     invert_x: bool = False
-    invert_y: bool = False
+    # Inverted by default, measured on the reference setup: with the screen
+    # tilted down at a case on the desk, sliding the hand toward the body must
+    # move the cursor down. The raw camera-Y sign gives the opposite, because
+    # the steep downward view flips how desk-plane motion projects into the
+    # image. Toggle live with F6 if a different screen angle reverses it.
+    invert_y: bool = True
 
     # Per-frame motion (in palm-width units) below this is treated as jitter.
     dead_zone: float = 0.004

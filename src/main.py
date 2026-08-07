@@ -9,6 +9,7 @@ Hotkeys are global (they work even when the preview window is not focused):
     ESC      quit
     P x5     toggle mouse control on/off  (emergency disable)
              -- five taps of P within five seconds
+    F5 / F6  invert the X / Y axis
     F7       cycle how the controlling hand is chosen
     F9       cycle the palm anchor strategy
     F10      re-centre / reset the motion filter
@@ -31,6 +32,8 @@ from src.config.settings import USER_CONFIG_PATH, AppSettings
 from src.debug.hud import HudState, render
 from src.hotkeys import (
     VK_ESCAPE,
+    VK_F5,
+    VK_F6,
     VK_F7,
     VK_F9,
     VK_F10,
@@ -61,6 +64,8 @@ log = logging.getLogger("airpods_mouse")
 _HOTKEY_BINDINGS = {
     "quit": VK_ESCAPE,
     "toggle_mouse": VK_P,
+    "invert_x": VK_F5,
+    "invert_y": VK_F6,
     "swap_hand": VK_F7,
     "cycle_anchor": VK_F9,
     "recenter": VK_F10,
@@ -240,6 +245,8 @@ class AirPodsMouseApp:
                     status_message=self._active_status(),
                     observations=observations,
                     selection=settings.tracking.selection,
+                    invert_x=settings.cursor.invert_x,
+                    invert_y=settings.cursor.invert_y,
                 )
                 render(frame, state, draw_skeleton=settings.debug.draw_landmarks)
                 cv2.imshow(settings.debug.window_name, frame)
@@ -282,6 +289,20 @@ class AirPodsMouseApp:
                 self._set_status(f"P {taps}/{needed}...", duration=TOGGLE_PRESS_WINDOW)
         else:
             self._toggle_taps.expire(now)
+
+        for axis in ("x", "y"):
+            if self._hotkeys.just_pressed(f"invert_{axis}"):
+                attribute = f"invert_{axis}"
+                cursor = self._settings.cursor
+                flipped = not getattr(cursor, attribute)
+                setattr(cursor, attribute, flipped)
+                # The mapper caches the settings object, so no rebuild is
+                # needed; just drop history so the flip cannot emit one
+                # doubled delta.
+                self._mapper.reset()
+                self._mouse.reset_residual()
+                log.info("invert_%s -> %s", axis, flipped)
+                self._set_status(f"invert {axis.upper()}: {'ON' if flipped else 'OFF'}")
 
         if self._hotkeys.just_pressed("swap_hand"):
             tracking = self._settings.tracking

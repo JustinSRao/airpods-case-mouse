@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import ctypes
 import sys
+from dataclasses import replace
 
 import numpy as np
 
@@ -130,17 +131,52 @@ for _ in range(60):
     total += abs(mapper.update(np.array([100.0, 100.0]), 80.0, 1 / 30).dx)
 check("stationary hand produces zero drift", total == 0.0, f"drifted {total:.4f}px")
 
-# Moving right must move the cursor right.
-mapper.reset()
-mapper.update(np.array([100.0, 100.0]), 80.0, 1 / 30)
-right = [mapper.update(np.array([100.0 + i * 4, 100.0]), 80.0, 1 / 30) for i in range(1, 20)]
-check("rightward hand -> positive dx", right[-1].dx > 0, f"dx={right[-1].dx:.2f}")
+def sweep(cursor_settings, delta: np.ndarray) -> tuple[float, float]:
+    """Run a steady sweep and return the final (dx, dy)."""
+    m = MotionMapper(cursor_settings)
+    m.update(np.array([100.0, 100.0]), 80.0, 1 / 30)
+    last = None
+    for i in range(1, 20):
+        last = m.update(np.array([100.0, 100.0]) + delta * i, 80.0, 1 / 30)
+    return (last.dx, last.dy)
 
-# Moving up in the image (hand pushed away from the body) -> cursor up.
-mapper.reset()
-mapper.update(np.array([100.0, 100.0]), 80.0, 1 / 30)
-up = [mapper.update(np.array([100.0, 100.0 - i * 4]), 80.0, 1 / 30) for i in range(1, 20)]
-check("upward hand -> negative dy", up[-1].dy < 0, f"dy={up[-1].dy:.2f}")
+
+RIGHT = np.array([4.0, 0.0])
+IMAGE_UP = np.array([0.0, -4.0])
+
+# Axis signs are tested against explicit settings rather than whatever the
+# config currently says, so flipping a default cannot silently pass.
+plain = replace(settings.cursor, invert_x=False, invert_y=False)
+dx, _ = sweep(plain, RIGHT)
+check("rightward hand -> positive dx", dx > 0, f"dx={dx:.2f}")
+_, dy = sweep(plain, IMAGE_UP)
+check("uninverted: up in image -> negative dy", dy < 0, f"dy={dy:.2f}")
+
+flipped_y = replace(settings.cursor, invert_x=False, invert_y=True)
+_, dy_flipped = sweep(flipped_y, IMAGE_UP)
+check("invert_y flips the sign", dy_flipped > 0, f"dy={dy_flipped:.2f}")
+
+flipped_x = replace(settings.cursor, invert_x=True, invert_y=False)
+dx_flipped, _ = sweep(flipped_x, RIGHT)
+check("invert_x flips the sign", dx_flipped < 0, f"dx={dx_flipped:.2f}")
+
+# The shipped default is invert_y=True, measured on the reference setup
+# rather than derived: the raw camera-Y sign gave the opposite of what the
+# hand was doing. Assert the default carries that, so a config edit that
+# silently reverts it fails here instead of in the user's hand.
+shipped = settings.cursor
+check(
+    "default config ships invert_y enabled",
+    shipped.invert_y is True,
+    f"invert_y={shipped.invert_y}",
+)
+_, dy_shipped = sweep(shipped, IMAGE_UP)
+_, dy_raw = sweep(plain, IMAGE_UP)
+check(
+    "default config inverts Y relative to raw camera motion",
+    dy_shipped * dy_raw < 0,
+    f"shipped={dy_shipped:.2f} raw={dy_raw:.2f}",
+)
 
 # Scale invariance of the whole mapping: the same motion expressed as a
 # fraction of palm width must give the same cursor delta at any hand size.

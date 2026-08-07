@@ -48,6 +48,8 @@ class HudState:
     # Without this, an inverted handedness label just looks like "no hand".
     observations: list[HandObservation] = field(default_factory=list)
     selection: str = "rightmost"
+    invert_x: bool = False
+    invert_y: bool = True
 
 
 def draw_landmarks(frame: np.ndarray, hand: HandObservation) -> None:
@@ -125,6 +127,8 @@ def draw_panel(frame: np.ndarray, state: HudState) -> None:
     lines.append((f"  dy: {motion.dy:+7.2f}", _GREY))
     lines.append((f"  speed: {motion.hand_speed:5.2f} pw/s", _GREY))
     lines.append((f"  gain:  {motion.gain:5.2f}", _GREY))
+    axes = f"  invert X:{'Y' if state.invert_x else 'n'} (F5)  Y:{'Y' if state.invert_y else 'n'} (F6)"
+    lines.append((axes, _GREY))
     if motion.in_dead_zone:
         lines.append(("  [dead zone]", _AMBER))
     if motion.clamped:
