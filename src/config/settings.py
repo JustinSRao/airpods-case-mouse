@@ -1,0 +1,183 @@
+"""Typed application settings, loaded from JSON with layered overrides.
+
+Two files are involved:
+
+* ``config/default_config.json`` -- committed defaults, always loaded first.
+* ``config/config.json``        -- optional, git-ignored, machine-specific
+                                   overrides (calibration lives here later).
+
+Any key absent from a file simply keeps the value from the layer below it, so
+the user config only needs to contain the handful of values being tuned.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from dataclasses import asdict, dataclass, field, is_dataclass
+from pathlib import Path
+from typing import Any
+
+log = logging.getLogger(__name__)
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CONFIG_PATH = REPO_ROOT / "config" / "default_config.json"
+USER_CONFIG_PATH = REPO_ROOT / "config" / "config.json"
+DEFAULT_MODEL_PATH = REPO_ROOT / "models" / "hand_landmarker.task"
+
+
+@dataclass
+class CameraSettings:
+    """Webcam capture parameters.
+
+    ``backend`` defaults to DirectShow: on this machine the Media Foundation
+    backend throws a ``cv::Mat`` step assertion at 1280x720, while DirectShow
+    is stable at every resolution tested.
+    """
+
+    index: int = 0
+    width: int = 640
+    height: int = 480
+    target_fps: int = 30
+    backend: str = "dshow"  # "dshow" | "msmf" | "any"
+    # Webcams show a non-mirrored view. Flipping gives the natural "selfie"
+    # view AND makes MediaPipe's handedness label match the real-world hand.
+    flip_horizontal: bool = True
+
+
+@dataclass
+class TrackingSettings:
+    """MediaPipe HandLandmarker parameters."""
+
+    model_path: str = str(DEFAULT_MODEL_PATH)
+    num_hands: int = 1
+    min_hand_detection_confidence: float = 0.5
+    min_hand_presence_confidence: float = 0.5
+    min_tracking_confidence: float = 0.5
+    # Which hand drives the mouse. MediaPipe labels handedness assuming a
+    # mirrored image, which is exactly what flip_horizontal gives us.
+    target_handedness: str = "Right"
+    # Seconds without the target hand before all mouse buttons are released.
+    tracking_loss_timeout: float = 0.35
+    # Below this handedness score the observation is treated as "no hand".
+    min_confidence_for_control: float = 0.5
+
+
+@dataclass
+class AnchorSettings:
+    """Which landmark(s) define the point we track for cursor motion."""
+
+    # "wrist" | "mcp_centroid" | "palm_centroid"
+    #   wrist         - landmark 0 only. Most affected by wrist rotation.
+    #   mcp_centroid  - mean of the four finger MCP knuckles.
+    #   palm_centroid - mean of wrist + the four MCP knuckles (default).
+    strategy: str = "palm_centroid"
+
+
+@dataclass
+class CursorSettings:
+    """Camera-space motion -> screen-pixel motion mapping."""
+
+    # Screen pixels per one "palm width" of hand travel. Deltas are divided by
+    # the measured palm width first, so sensitivity is independent of how far
+    # the hand sits from the camera.
+    sensitivity: float = 1600.0
+    x_sensitivity: float = 1.0
+    y_sensitivity: float = 1.0
+    invert_x: bool = False
+    invert_y: bool = False
+
+    # Per-frame motion (in palm-width units) below this is treated as jitter.
+    dead_zone: float = 0.004
+
+    # "ema" | "one_euro" | "none". EMA is the simple default; One Euro is
+    # available for Milestone 8 tuning.
+    filter: str = "ema"
+    # EMA weight of the newest sample: 1.0 = no smoothing, lower = smoother
+    # but laggier.
+    smoothing: float = 0.5
+    one_euro_min_cutoff: float = 1.0
+    one_euro_beta: float = 0.02
+    one_euro_d_cutoff: float = 1.0
+
+    # Gain curve: gain = 1 + acceleration * speed, where speed is in
+    # palm-widths/second. 0.0 disables acceleration entirely.
+    acceleration: float = 0.35
+    # Hard ceiling on cursor speed, in screen pixels per second.
+    max_velocity: float = 4000.0
+
+
+@dataclass
+class GestureSettings:
+    """Finger-press thresholds. Placeholders until Milestone 3/4."""
+
+    index_press_threshold: float = 0.62
+    index_release_threshold: float = 0.45
+    middle_press_threshold: float = 0.62
+    middle_release_threshold: float = 0.45
+
+
+@dataclass
+class DebugSettings:
+    show_preview: bool = True
+    window_name: str = "AirPods Mouse - Debug"
+    draw_landmarks: bool = True
+    log_level: str = "INFO"
+
+
+@dataclass
+class AppSettings:
+    camera: CameraSettings = field(default_factory=CameraSettings)
+    tracking: TrackingSettings = field(default_factory=TrackingSettings)
+    anchor: AnchorSettings = field(default_factory=AnchorSettings)
+    cursor: CursorSettings = field(default_factory=CursorSettings)
+    gestures: GestureSettings = field(default_factory=GestureSettings)
+    debug: DebugSettings = field(default_factory=DebugSettings)
+
+    @classmethod
+    def load(
+        cls,
+        default_path: Path = DEFAULT_CONFIG_PATH,
+        user_path: Path | None = USER_CONFIG_PATH,
+    ) -> AppSettings:
+        settings = cls()
+        for path in (default_path, user_path):
+            if path is None:
+                continue
+            if not path.is_file():
+                # A missing user config is normal; a missing default is not.
+                level = logging.DEBUG if path == user_path else logging.WARNING
+                log.log(level, "Config not found, skipping: %s", path)
+                continue
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            _merge_into_dataclass(settings, data, path.name)
+            log.info("Loaded config: %s", path)
+        return settings
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    def save(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as fh:
+            json.dump(self.to_dict(), fh, indent=2)
+            fh.write("\n")
+        log.info("Saved config: %s", path)
+
+
+def _merge_into_dataclass(target: Any, data: dict[str, Any], source: str) -> None:
+    """Recursively apply ``data`` onto the dataclass instance ``target``.
+
+    Unknown keys are warned about rather than silently dropped, so typos in a
+    hand-edited config surface immediately.
+    """
+    for key, value in data.items():
+        if not hasattr(target, key):
+            log.warning("Unknown config key %r in %s (ignored)", key, source)
+            continue
+        current = getattr(target, key)
+        if is_dataclass(current) and isinstance(value, dict):
+            _merge_into_dataclass(current, value, source)
+        else:
+            setattr(target, key, value)
