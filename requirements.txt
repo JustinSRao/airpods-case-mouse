@@ -1,0 +1,11 @@
+# MediaPipe 1.0.0 uses the Tasks API; the legacy mediapipe.solutions.hands
+# module no longer exists. It pulls in opencv-contrib-python and numpy, so do
+# NOT also install opencv-python -- the two packages conflict.
+mediapipe>=1.0.0,<2.0.0
+
+# Pinned transitively by mediapipe, listed for clarity.
+numpy>=2.0
+opencv-contrib-python>=5.0
+
+# Windows mouse control and global hotkeys use ctypes from the standard
+# library, so there is no dependency for either.

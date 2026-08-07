@@ -1,0 +1,49 @@
+{
+  "camera": {
+    "index": 0,
+    "width": 640,
+    "height": 480,
+    "target_fps": 30,
+    "backend": "dshow",
+    "flip_horizontal": true
+  },
+  "tracking": {
+    "num_hands": 1,
+    "min_hand_detection_confidence": 0.5,
+    "min_hand_presence_confidence": 0.5,
+    "min_tracking_confidence": 0.5,
+    "target_handedness": "Right",
+    "tracking_loss_timeout": 0.35,
+    "min_confidence_for_control": 0.5
+  },
+  "anchor": {
+    "strategy": "palm_centroid"
+  },
+  "cursor": {
+    "sensitivity": 1600.0,
+    "x_sensitivity": 1.0,
+    "y_sensitivity": 1.0,
+    "invert_x": false,
+    "invert_y": false,
+    "dead_zone": 0.004,
+    "filter": "ema",
+    "smoothing": 0.5,
+    "one_euro_min_cutoff": 1.0,
+    "one_euro_beta": 0.02,
+    "one_euro_d_cutoff": 1.0,
+    "acceleration": 0.35,
+    "max_velocity": 4000.0
+  },
+  "gestures": {
+    "index_press_threshold": 0.62,
+    "index_release_threshold": 0.45,
+    "middle_press_threshold": 0.62,
+    "middle_release_threshold": 0.45
+  },
+  "debug": {
+    "show_preview": true,
+    "window_name": "AirPods Mouse - Debug",
+    "draw_landmarks": true,
+    "log_level": "INFO"
+  }
+}
