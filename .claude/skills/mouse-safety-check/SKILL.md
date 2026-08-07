@@ -24,7 +24,7 @@ Walk the diff against every item. Anything unchecked blocks the commit.
       just a clean return.
 - [ ] **Tracking loss** — buttons released after `tracking_loss_timeout`. Test
       by pulling the hand out of frame mid-press.
-- [ ] **Control toggle (F8)** — disabling releases immediately, no timeout.
+- [ ] **Control toggle (P ×5)** — disabling releases immediately, no timeout.
 - [ ] **Camera failure** — a dead camera raises rather than spinning forever;
       the raise must unwind through the `finally`.
 - [ ] **Low confidence** — dropping below `min_confidence_for_control` is
@@ -49,7 +49,7 @@ window is under the pointer. Keep it that way: if you add button tests, stub
 `MouseController._send`.
 
 For live testing, always start with control **off** (the default) and enable
-with F8 only once the HUD confirms tracking.
+with five taps of P only once the HUD confirms tracking.
 
 ## Reviewing new code
 
@@ -63,6 +63,6 @@ nobody can find.
 
 ## If the user reports a stuck button right now
 
-Tell them immediately: press **F8** to disable control, or **ESC** to quit. If
+Tell them immediately: tap **P** five times to disable control, or **ESC** to quit. If
 the program is already dead and the button is still held, a physical mouse
 click of the same button clears it, since the OS button state is global.

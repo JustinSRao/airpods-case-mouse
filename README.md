@@ -103,7 +103,7 @@ which is what every command below does.
 ## Running
 
 ```powershell
-# Debug preview, mouse control OFF until you press F8 (recommended first run)
+# Debug preview, mouse control OFF until you tap P five times (recommended first run)
 .\.venv\Scripts\python.exe -m src.main
 
 # Start with mouse control already enabled
@@ -111,7 +111,7 @@ which is what every command below does.
 ```
 
 Mouse control starts **disabled on purpose**. Get your hand positioned and
-confirm the HUD says `RIGHT HAND: TRACKING` before pressing F8.
+confirm the HUD says `RIGHT HAND: TRACKING` before enabling it.
 
 ### Hotkeys
 
@@ -121,10 +121,14 @@ what you have lost.
 
 | Key | Action |
 | --- | --- |
-| `F8` | Toggle mouse control ON/OFF (**emergency disable**) |
+| `P` ×5 | Toggle mouse control ON/OFF (**emergency disable**) — five taps within five seconds |
 | `ESC` | Quit immediately |
 | `F9` | Cycle the palm anchor strategy (wrist → MCP centroid → palm centroid) |
 | `F10` | Reset the motion filter |
+
+The toggle needs a burst of taps rather than a single press because `P` is an
+ordinary letter key — one tap would fire constantly while typing. The HUD shows
+`P 3/5...` as you tap, and the count decays after five seconds.
 
 ### Useful flags
 
@@ -155,7 +159,7 @@ This matters more than any config value.
    - the magenta anchor circle sits in the middle of your palm and stays put
      when you hold still,
    - `palm width` reads roughly 60–110 px.
-5. Press **F8** and move the case.
+5. Tap **P** five times and move the case.
 
 Good lighting on your hand helps a lot. Backlighting (a bright window behind
 the desk) is the most common cause of unstable tracking.
@@ -259,7 +263,7 @@ The program controls your mouse, so it is built to fail safe. All virtual
 buttons are released when:
 
 - the right hand disappears for longer than `tracking_loss_timeout`,
-- mouse control is toggled off with F8,
+- mouse control is toggled off with five taps of P,
 - the camera stops delivering frames,
 - an exception escapes the capture loop,
 - the application exits for any reason (`try/finally`).

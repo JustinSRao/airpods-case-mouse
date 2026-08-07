@@ -169,7 +169,44 @@ max_step = settings.cursor.max_velocity / 30
 check("velocity clamp engages", huge.clamped and abs(huge.dx) <= max_step + 1e-6,
       f"dx={huge.dx:.1f} limit={max_step:.1f}")
 
-print("\n[5] mouse controller (send path stubbed)")
+print("\n[5] multi-press toggle (P x5 within 5s)")
+from src.hotkeys import MultiPressDetector  # noqa: E402
+from src.main import TOGGLE_PRESS_COUNT, TOGGLE_PRESS_WINDOW  # noqa: E402
+
+det = MultiPressDetector(TOGGLE_PRESS_COUNT, TOGGLE_PRESS_WINDOW)
+fired = [det.register(t) for t in (0.0, 0.2, 0.4, 0.6, 0.8)]
+check("five fast taps fire once", fired == [False, False, False, False, True], f"{fired}")
+
+det.reset()
+fired = [det.register(t) for t in (0.0, 0.2, 0.4, 0.6)]
+check("four taps do not fire", not any(fired), f"{fired}")
+
+# Taps spread beyond the window must never accumulate into a trigger.
+det.reset()
+slow = [det.register(t) for t in (0.0, 2.0, 4.0, 6.0, 8.0, 10.0, 12.0)]
+check("slow taps outside the window never fire", not any(slow), f"{slow}")
+
+# Four taps, then a long gap, then four more: neither burst reaches five.
+det.reset()
+straddle = [det.register(t) for t in (0.0, 0.5, 1.0, 1.5, 20.0, 20.5, 21.0, 21.5)]
+check("stale taps expire before a new burst", not any(straddle), f"{straddle}")
+
+# A second burst after a successful trigger must need five fresh taps.
+det.reset()
+for t in (0.0, 0.1, 0.2, 0.3, 0.4):
+    det.register(t)
+again = [det.register(t) for t in (0.5, 0.6, 0.7, 0.8)]
+check("counter clears after firing", not any(again), f"{again}")
+check("fifth tap of second burst fires", det.register(0.9) is True)
+
+det.reset()
+det.register(0.0)
+det.register(0.1)
+check("progress reports partial count", det.progress == (2, 5), f"{det.progress}")
+det.expire(10.0)
+check("expire decays stale progress", det.progress == (0, 5), f"{det.progress}")
+
+print("\n[6] mouse controller (send path stubbed)")
 check("INPUT struct is the size Windows expects",
       ctypes.sizeof(mc._INPUT) in (28, 40),
       f"sizeof={ctypes.sizeof(mc._INPUT)}")

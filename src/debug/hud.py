@@ -114,7 +114,7 @@ def draw_panel(frame: np.ndarray, state: HudState) -> None:
     lines.append(("MIDDLE: (milestone 4)", _GREY))
 
     lines.append(("", _WHITE))
-    lines.append(("ESC quit | F8 mouse | F9 anchor", _GREY))
+    lines.append(("ESC quit | PPPPP mouse | F9 anchor", _GREY))
     if state.status_message:
         lines.append((state.status_message, _AMBER))
 

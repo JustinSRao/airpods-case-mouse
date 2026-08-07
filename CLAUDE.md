@@ -26,7 +26,7 @@ the Windows cursor. Milestones 1–2 done (tracking + cursor). Milestone 3
 ## Commands
 
 ```powershell
-.\.venv\Scripts\python.exe -m src.main                      # run (mouse off; F8 enables)
+.\.venv\Scripts\python.exe -m src.main                      # run (mouse off; tap P x5 to enable)
 .\.venv\Scripts\python.exe -m src.main --run-seconds 6 --no-preview   # smoke test
 .\.venv\Scripts\python.exe -m scripts.self_check            # offline checks
 .\.venv\Scripts\python.exe -m scripts.bench --seconds 10    # perf + jitter profile

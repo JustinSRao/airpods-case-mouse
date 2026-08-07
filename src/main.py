@@ -6,10 +6,11 @@ Run from the repository root:
 
 Hotkeys are global (they work even when the preview window is not focused):
 
-    ESC  quit
-    F8   toggle mouse control on/off  (emergency disable)
-    F9   cycle the palm anchor strategy
-    F10  re-centre / reset the motion filter
+    ESC      quit
+    P x5     toggle mouse control on/off  (emergency disable)
+             -- five taps of P within five seconds
+    F9       cycle the palm anchor strategy
+    F10      re-centre / reset the motion filter
 """
 
 from __future__ import annotations
@@ -27,7 +28,14 @@ import numpy as np
 from src.camera.camera_manager import CameraError, CameraManager
 from src.config.settings import USER_CONFIG_PATH, AppSettings
 from src.debug.hud import HudState, render
-from src.hotkeys import VK_ESCAPE, VK_F8, VK_F9, VK_F10, Hotkeys
+from src.hotkeys import (
+    VK_ESCAPE,
+    VK_F9,
+    VK_F10,
+    VK_P,
+    Hotkeys,
+    MultiPressDetector,
+)
 from src.mouse.motion_mapper import MotionMapper, MotionResult
 from src.mouse.mouse_controller import (
     MouseController,
@@ -46,10 +54,15 @@ log = logging.getLogger("airpods_mouse")
 
 _HOTKEY_BINDINGS = {
     "quit": VK_ESCAPE,
-    "toggle_mouse": VK_F8,
+    "toggle_mouse": VK_P,
     "cycle_anchor": VK_F9,
     "recenter": VK_F10,
 }
+
+# Tapping a plain letter key once would fire constantly during normal typing,
+# so the toggle requires a deliberate burst.
+TOGGLE_PRESS_COUNT = 5
+TOGGLE_PRESS_WINDOW = 5.0
 
 
 class FpsMeter:
@@ -95,6 +108,9 @@ class AirPodsMouseApp:
         self._mouse = MouseController()
         self._mapper = MotionMapper(settings.cursor)
         self._hotkeys = Hotkeys(_HOTKEY_BINDINGS)
+        self._toggle_taps = MultiPressDetector(
+            count=TOGGLE_PRESS_COUNT, window=TOGGLE_PRESS_WINDOW
+        )
         self._fps = FpsMeter()
 
         self._last_hand_time: float | None = None
@@ -121,7 +137,7 @@ class AirPodsMouseApp:
         screen_w, screen_h = get_screen_size()
         log.info("Primary display: %dx%d", screen_w, screen_h)
         log.info(
-            "Mouse control starts %s -- press F8 to toggle",
+            "Mouse control starts %s -- tap P five times within five seconds to toggle",
             "ENABLED" if self._mouse_enabled else "DISABLED",
         )
 
@@ -240,14 +256,15 @@ class AirPodsMouseApp:
         if self._hotkeys.just_pressed("quit"):
             self._request_quit("ESC")
 
+        now = time.perf_counter()
         if self._hotkeys.just_pressed("toggle_mouse"):
-            self._mouse_enabled = not self._mouse_enabled
-            if not self._mouse_enabled:
-                self._mouse.release_all()
-                self._mouse.reset_residual()
-            self._mapper.reset()
-            log.info("Mouse control %s", "ENABLED" if self._mouse_enabled else "DISABLED")
-            self._set_status(f"mouse {'ON' if self._mouse_enabled else 'OFF'}")
+            if self._toggle_taps.register(now):
+                self._toggle_mouse_control()
+            else:
+                taps, needed = self._toggle_taps.progress
+                self._set_status(f"P {taps}/{needed}...", duration=TOGGLE_PRESS_WINDOW)
+        else:
+            self._toggle_taps.expire(now)
 
         if self._hotkeys.just_pressed("cycle_anchor"):
             self._anchor_index = (self._anchor_index + 1) % len(ANCHOR_STRATEGY_NAMES)
@@ -259,6 +276,15 @@ class AirPodsMouseApp:
             self._mapper.reset()
             self._mouse.reset_residual()
             self._set_status("filter reset")
+
+    def _toggle_mouse_control(self) -> None:
+        self._mouse_enabled = not self._mouse_enabled
+        if not self._mouse_enabled:
+            self._mouse.release_all()
+            self._mouse.reset_residual()
+        self._mapper.reset()
+        log.info("Mouse control %s", "ENABLED" if self._mouse_enabled else "DISABLED")
+        self._set_status(f"mouse {'ON' if self._mouse_enabled else 'OFF'}")
 
     def _request_quit(self, reason: str) -> None:
         log.info("Quit requested via %s", reason)
@@ -290,7 +316,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--enable-mouse",
         action="store_true",
-        help="Start with mouse control already ON (default: OFF, press F8).",
+        help="Start with mouse control already ON (default: OFF, tap P five times).",
     )
     parser.add_argument(
         "--no-preview",
