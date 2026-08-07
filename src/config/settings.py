@@ -50,12 +50,27 @@ class TrackingSettings:
     """MediaPipe HandLandmarker parameters."""
 
     model_path: str = str(DEFAULT_MODEL_PATH)
-    num_hands: int = 1
+    # Two, so position-based selection can tell the hands apart. With only one
+    # slot MediaPipe may lock onto whichever hand it saw first.
+    num_hands: int = 2
     min_hand_detection_confidence: float = 0.5
     min_hand_presence_confidence: float = 0.5
     min_tracking_confidence: float = 0.5
-    # Which hand drives the mouse. MediaPipe labels handedness assuming a
-    # mirrored image, which is exactly what flip_horizontal gives us.
+
+    # How to choose which detected hand drives the mouse:
+    #   "rightmost"  - furthest right in the mirrored preview. Since the
+    #                  preview is mirrored, that IS the user's right hand.
+    #   "leftmost"   - mirror image of the above, for left-handed use.
+    #   "handedness" - trust MediaPipe's Left/Right label.
+    #
+    # Position is the default because handedness proved unreliable in the
+    # actual pose this app uses: a palm-down hand resting on a case, seen from
+    # a steeply angled-down webcam, gets confidently mislabelled (~0.97). A
+    # label that can flip when a finger bends would swap hands mid-click,
+    # whereas the hand on the case never crosses to the other side of frame.
+    selection: str = "rightmost"
+
+    # Only consulted when selection == "handedness".
     target_handedness: str = "Right"
     # Seconds without the target hand before all mouse buttons are released.
     tracking_loss_timeout: float = 0.35

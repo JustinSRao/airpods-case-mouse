@@ -7,7 +7,7 @@ guesses.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
@@ -44,6 +44,10 @@ class HudState:
     motion: MotionResult
     tracking_lost_for: float
     status_message: str = ""
+    # Every hand MediaPipe returned, whether or not it matched the target.
+    # Without this, an inverted handedness label just looks like "no hand".
+    observations: list[HandObservation] = field(default_factory=list)
+    selection: str = "rightmost"
 
 
 def draw_landmarks(frame: np.ndarray, hand: HandObservation) -> None:
@@ -89,13 +93,30 @@ def draw_panel(frame: np.ndarray, state: HudState) -> None:
     lines.append(("", _WHITE))
 
     if state.hand is not None:
-        lines.append((f"RIGHT HAND: TRACKING ({state.hand.score:.2f})", _GREEN))
+        lines.append(("HAND: TRACKING", _GREEN))
+        lines.append((f"select: {state.selection} (F7)", _GREY))
         lines.append((f"anchor: {state.anchor_strategy}", _GREY))
         lines.append((f"palm width: {state.palm_width_px:5.1f} px", _GREY))
     else:
-        lines.append(("RIGHT HAND: NOT DETECTED", _RED))
+        lines.append(("HAND: NOT DETECTED", _RED))
+        lines.append((f"select: {state.selection} (F7)", _GREY))
         if state.tracking_lost_for > 0:
             lines.append((f"lost for: {state.tracking_lost_for:.2f}s", _GREY))
+
+    # One line per detected hand, marking the chosen one. MediaPipe's
+    # handedness label is shown but not trusted -- it is confidently wrong for
+    # a palm-down hand seen from a steep angle, which is exactly this pose.
+    if state.observations:
+        for obs in state.observations:
+            chosen = obs is state.hand
+            marker = ">" if chosen else " "
+            colour = _GREEN if chosen else _GREY
+            x = float(obs.landmarks_px[:, 0].mean())
+            lines.append(
+                (f" {marker} {obs.handedness:<5} {obs.score:.2f}  x={x:4.0f}", colour)
+            )
+    else:
+        lines.append((" (no hands detected)", _GREY))
 
     lines.append(("", _WHITE))
     lines.append(("CURSOR", _WHITE))
@@ -114,7 +135,8 @@ def draw_panel(frame: np.ndarray, state: HudState) -> None:
     lines.append(("MIDDLE: (milestone 4)", _GREY))
 
     lines.append(("", _WHITE))
-    lines.append(("ESC quit | PPPPP mouse | F9 anchor", _GREY))
+    lines.append(("ESC quit | PPPPP mouse", _GREY))
+    lines.append(("F7 swap hand | F9 anchor", _GREY))
     if state.status_message:
         lines.append((state.status_message, _AMBER))
 

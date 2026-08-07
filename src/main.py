@@ -9,6 +9,7 @@ Hotkeys are global (they work even when the preview window is not focused):
     ESC      quit
     P x5     toggle mouse control on/off  (emergency disable)
              -- five taps of P within five seconds
+    F7       cycle how the controlling hand is chosen
     F9       cycle the palm anchor strategy
     F10      re-centre / reset the motion filter
 """
@@ -30,6 +31,7 @@ from src.config.settings import USER_CONFIG_PATH, AppSettings
 from src.debug.hud import HudState, render
 from src.hotkeys import (
     VK_ESCAPE,
+    VK_F7,
     VK_F9,
     VK_F10,
     VK_P,
@@ -48,13 +50,18 @@ from src.tracking.hand_features import (
     hand_scale,
     palm_width,
 )
-from src.tracking.hand_tracker import HandTracker, HandTrackerError
+from src.tracking.hand_tracker import (
+    SELECTION_MODES,
+    HandTracker,
+    HandTrackerError,
+)
 
 log = logging.getLogger("airpods_mouse")
 
 _HOTKEY_BINDINGS = {
     "quit": VK_ESCAPE,
     "toggle_mouse": VK_P,
+    "swap_hand": VK_F7,
     "cycle_anchor": VK_F9,
     "recenter": VK_F10,
 }
@@ -141,17 +148,25 @@ class AirPodsMouseApp:
             "ENABLED" if self._mouse_enabled else "DISABLED",
         )
 
+        # DirectShow takes a few seconds to enumerate devices. Say so, or the
+        # silence looks like a hang and invites a Ctrl+C.
+        log.info(
+            "Opening camera %d (DirectShow takes a few seconds)...",
+            settings.camera.index,
+        )
+
         try:
             with (
                 CameraManager(settings.camera) as camera,
                 HandTracker(settings.tracking) as tracker,
             ):
+                log.info("Ready. Preview window is open.")
                 self._loop(camera, tracker)
         except (CameraError, HandTrackerError) as exc:
             log.error("%s", exc)
             return 1
         except KeyboardInterrupt:
-            log.info("Interrupted by user")
+            log.info("Interrupted by user (Ctrl+C)")
         finally:
             # The single most important line in the program: never leave a
             # synthetic mouse button held down.
@@ -223,6 +238,8 @@ class AirPodsMouseApp:
                     motion=motion,
                     tracking_lost_for=self._time_since_hand(),
                     status_message=self._active_status(),
+                    observations=observations,
+                    selection=settings.tracking.selection,
                 )
                 render(frame, state, draw_skeleton=settings.debug.draw_landmarks)
                 cv2.imshow(settings.debug.window_name, frame)
@@ -265,6 +282,17 @@ class AirPodsMouseApp:
                 self._set_status(f"P {taps}/{needed}...", duration=TOGGLE_PRESS_WINDOW)
         else:
             self._toggle_taps.expire(now)
+
+        if self._hotkeys.just_pressed("swap_hand"):
+            tracking = self._settings.tracking
+            index = (SELECTION_MODES.index(tracking.selection) + 1) % len(
+                SELECTION_MODES
+            )
+            tracking.selection = SELECTION_MODES[index]
+            self._mapper.reset()
+            self._mouse.reset_residual()
+            log.info("Hand selection -> %s", tracking.selection)
+            self._set_status(f"select: {tracking.selection}")
 
         if self._hotkeys.just_pressed("cycle_anchor"):
             self._anchor_index = (self._anchor_index + 1) % len(ANCHOR_STRATEGY_NAMES)
@@ -330,6 +358,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Override the palm anchor strategy.",
     )
     parser.add_argument(
+        "--selection",
+        choices=SELECTION_MODES,
+        default=None,
+        help="How to choose the controlling hand. Cycle live with F7.",
+    )
+    parser.add_argument(
+        "--hand",
+        choices=("Right", "Left"),
+        default=None,
+        help="Handedness label to follow (only used with --selection handedness).",
+    )
+    parser.add_argument(
+        "--num-hands",
+        type=int,
+        default=None,
+        help="How many hands to detect. Use 2 to see both labels while debugging.",
+    )
+    parser.add_argument(
         "--run-seconds",
         type=float,
         default=None,
@@ -347,6 +393,12 @@ def main(argv: list[str] | None = None) -> int:
         settings.camera.index = args.camera_index
     if args.anchor is not None:
         settings.anchor.strategy = args.anchor
+    if args.hand is not None:
+        settings.tracking.target_handedness = args.hand
+    if args.selection is not None:
+        settings.tracking.selection = args.selection
+    if args.num_hands is not None:
+        settings.tracking.num_hands = args.num_hands
     if args.no_preview:
         settings.debug.show_preview = False
     if args.log_level is not None:

@@ -36,6 +36,9 @@ HAND_CONNECTIONS: tuple[tuple[int, int], ...] = tuple(
 )
 
 
+SELECTION_MODES: tuple[str, ...] = ("rightmost", "leftmost", "handedness", "any")
+
+
 class HandTrackerError(RuntimeError):
     """Raised when the landmark model cannot be loaded."""
 
@@ -60,6 +63,12 @@ class HandObservation:
     landmarks_px: np.ndarray
     landmarks_norm: np.ndarray
     world_landmarks: np.ndarray
+
+
+def _mean_x(observation: HandObservation) -> float:
+    """Mean landmark x in pixels -- a whole-hand position, robust to a
+    single landmark jittering."""
+    return float(observation.landmarks_px[:, 0].mean())
 
 
 class HandTracker:
@@ -136,17 +145,38 @@ class HandTracker:
     def select_hand(
         self, observations: list[HandObservation]
     ) -> HandObservation | None:
-        """Pick the configured hand, requiring a minimum handedness score."""
-        wanted = self._settings.target_handedness.lower()
-        candidates = [
-            obs
-            for obs in observations
-            if obs.handedness.lower() == wanted
-            and obs.score >= self._settings.min_confidence_for_control
-        ]
-        if not candidates:
+        """Pick the hand that drives the mouse, per the configured strategy."""
+        if not observations:
             return None
-        return max(candidates, key=lambda obs: obs.score)
+
+        mode = self._settings.selection.lower()
+
+        if mode == "handedness":
+            wanted = self._settings.target_handedness.lower()
+            candidates = [
+                obs
+                for obs in observations
+                if obs.handedness.lower() == wanted
+                and obs.score >= self._settings.min_confidence_for_control
+            ]
+            if not candidates:
+                return None
+            return max(candidates, key=lambda obs: obs.score)
+
+        # Position-based modes ignore the handedness label entirely, so the
+        # score threshold (which measures label confidence, not detection
+        # quality) does not apply.
+        if mode == "rightmost":
+            return max(observations, key=_mean_x)
+        if mode == "leftmost":
+            return min(observations, key=_mean_x)
+        if mode == "any":
+            return observations[0]
+
+        raise ValueError(
+            f"Unknown hand selection mode {self._settings.selection!r}; "
+            f"expected one of {SELECTION_MODES}"
+        )
 
     def close(self) -> None:
         if self._landmarker is not None:

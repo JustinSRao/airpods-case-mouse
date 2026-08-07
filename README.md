@@ -123,6 +123,7 @@ what you have lost.
 | --- | --- |
 | `P` ×5 | Toggle mouse control ON/OFF (**emergency disable**) — five taps within five seconds |
 | `ESC` | Quit immediately |
+| `F7` | Cycle how the controlling hand is chosen (rightmost → leftmost → handedness → any) |
 | `F9` | Cycle the palm anchor strategy (wrist → MCP centroid → palm centroid) |
 | `F10` | Reset the motion filter |
 
@@ -288,10 +289,18 @@ Try `--camera-index 1`.
 **Camera opens but crashes at higher resolution**
 Known Media Foundation bug — keep `backend` as `dshow`.
 
-**HUD says `RIGHT HAND: NOT DETECTED` but your hand is clearly visible**
-The frame is mirrored so MediaPipe's handedness matches your real hand. If your
-setup somehow reverses this, set `tracking.target_handedness` to `"Left"`. To
-confirm, set `num_hands` to 2 and watch which label appears.
+**The wrong hand is being tracked**
+Press **F7** to cycle the selection mode. The HUD lists every detected hand with
+a `>` beside the chosen one, so you can see the effect immediately.
+
+Note that MediaPipe's `Left`/`Right` labels are **not trusted by default**, and
+for good reason: with a palm-down hand resting on a case, seen from a steeply
+angled-down webcam, it confidently mislabels which hand is which (~0.97
+confidence on the wrong answer). Since a label that flips when a finger bends
+would swap hands mid-click, the default `rightmost` mode picks by position
+instead — and the hand on the case never crosses to the other side of frame.
+
+Left-handed? Use `--selection leftmost`.
 
 **Cursor jitters while your hand is still**
 Raise `cursor.dead_zone`. Run `scripts.bench` to see your actual anchor jitter

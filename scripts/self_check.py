@@ -169,7 +169,62 @@ max_step = settings.cursor.max_velocity / 30
 check("velocity clamp engages", huge.clamped and abs(huge.dx) <= max_step + 1e-6,
       f"dx={huge.dx:.1f} limit={max_step:.1f}")
 
-print("\n[5] multi-press toggle (P x5 within 5s)")
+print("\n[5] hand selection")
+from src.tracking.hand_tracker import SELECTION_MODES, HandObservation, HandTracker  # noqa: E402
+
+
+def fake_hand(mean_x: float, handedness: str, score: float = 0.97) -> HandObservation:
+    pts = synthetic_hand(offset=np.array([mean_x - 118.0, 0.0]))
+    return HandObservation(
+        handedness=handedness,
+        score=score,
+        landmarks_px=pts.astype(np.float32),
+        landmarks_norm=np.zeros((21, 3), dtype=np.float32),
+        world_landmarks=np.zeros((21, 3), dtype=np.float32),
+    )
+
+
+# The real failure seen on camera: MediaPipe confidently labels the physically
+# LEFT hand "Right". Position-based selection must ignore that entirely.
+left_hand_mislabelled_right = fake_hand(150.0, "Right", 0.96)
+right_hand_mislabelled_left = fake_hand(500.0, "Left", 0.98)
+both = [left_hand_mislabelled_right, right_hand_mislabelled_left]
+
+tracker_settings = AppSettings.load().tracking
+tracker_settings.selection = "rightmost"
+picker = HandTracker(tracker_settings)
+chosen = picker.select_hand(both)
+check(
+    "rightmost picks the hand on the right despite a wrong label",
+    chosen is right_hand_mislabelled_left,
+    f"picked {chosen.handedness if chosen else None}",
+)
+
+tracker_settings.selection = "leftmost"
+check("leftmost picks the other one", picker.select_hand(both) is left_hand_mislabelled_right)
+
+tracker_settings.selection = "handedness"
+tracker_settings.target_handedness = "Right"
+check(
+    "handedness mode follows the label (and so picks wrong here)",
+    picker.select_hand(both) is left_hand_mislabelled_right,
+)
+
+tracker_settings.selection = "rightmost"
+check("selection with no hands returns None", picker.select_hand([]) is None)
+check("selection with one hand returns it", picker.select_hand([both[0]]) is both[0])
+
+tracker_settings.selection = "bogus"
+try:
+    picker.select_hand(both)
+    check("unknown selection mode raises", False, "no error")
+except ValueError:
+    check("unknown selection mode raises", True)
+
+check("default selection is a known mode",
+      AppSettings.load().tracking.selection in SELECTION_MODES)
+
+print("\n[6] multi-press toggle (P x5 within 5s)")
 from src.hotkeys import MultiPressDetector  # noqa: E402
 from src.main import TOGGLE_PRESS_COUNT, TOGGLE_PRESS_WINDOW  # noqa: E402
 
@@ -206,7 +261,7 @@ check("progress reports partial count", det.progress == (2, 5), f"{det.progress}
 det.expire(10.0)
 check("expire decays stale progress", det.progress == (0, 5), f"{det.progress}")
 
-print("\n[6] mouse controller (send path stubbed)")
+print("\n[7] mouse controller (send path stubbed)")
 check("INPUT struct is the size Windows expects",
       ctypes.sizeof(mc._INPUT) in (28, 40),
       f"sizeof={ctypes.sizeof(mc._INPUT)}")
