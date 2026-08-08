@@ -27,6 +27,8 @@ import statistics
 import time
 from dataclasses import dataclass
 
+from pathlib import Path
+
 import cv2
 
 from src.camera.camera_manager import CameraManager
@@ -74,6 +76,9 @@ RATE_FRACTION = 0.45
 
 # A transient must beat quiet noise by at least this factor to be trusted.
 MIN_RATE_MARGIN = 2.5
+
+# Raw recordings land here (git-ignored) so analysis can be re-run offline.
+DEFAULT_RECORDING_DIR = Path(__file__).resolve().parents[1] / "data"
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -351,13 +356,24 @@ class RateResult:
     quiet_peak: float
 
     @property
+    def down_margin(self) -> float:
+        """How far the pressing movement clears quiet noise."""
+        return self.down_peak / max(self.quiet_peak, 1e-9)
+
+    @property
+    def up_margin(self) -> float:
+        return self.up_peak / max(self.quiet_peak, 1e-9)
+
+    @property
     def clean(self) -> bool:
-        return self.press > self.quiet_peak and -self.release > self.quiet_peak
+        return (
+            self.down_margin >= MIN_RATE_MARGIN and self.up_margin >= MIN_RATE_MARGIN
+        )
 
     @property
     def margin(self) -> float:
-        """Smallest headroom between a real transient and quiet noise."""
-        return min(self.down_peak, self.up_peak) / max(self.quiet_peak, 1e-9)
+        """The weaker of the two directions -- both must work to click."""
+        return min(self.down_margin, self.up_margin)
 
 
 def analyse_rates(
@@ -487,6 +503,50 @@ class MetricScore:
         )
 
 
+def save_recording(
+    path: Path,
+    finger_data: dict[str, tuple[dict[str, list], list]],
+    settings_used: dict,
+) -> None:
+    """Persist the raw recording so analysis can be redone without the camera.
+
+    Re-running calibration costs the user a minute and a fresh performance of
+    the gesture, and no two performances are identical -- which makes tuning
+    the analysis against live runs both slow and unreliable. Saving the
+    samples means parameters can be swept offline against one fixed take.
+    """
+    payload = {
+        "version": 1,
+        "recorded_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "settings": settings_used,
+        "fingers": {
+            finger: {
+                "cues": cues,
+                "metrics": {name: samples for name, samples in recorded.items()},
+            }
+            for finger, (recorded, cues) in finger_data.items()
+        },
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh)
+    print(f"\nRaw recording saved: {path}")
+
+
+def load_recording(path: Path) -> tuple[dict[str, tuple[dict[str, list], list]], dict]:
+    with path.open("r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    finger_data = {
+        finger: (
+            {name: [tuple(s) for s in samples]
+             for name, samples in blob["metrics"].items()},
+            [tuple(c) for c in blob["cues"]],
+        )
+        for finger, blob in payload["fingers"].items()
+    }
+    return finger_data, payload.get("settings", {})
+
+
 def analyse_transient(
     recorded: dict[str, list[tuple[float, float, bool]]],
     cues: list[tuple[float, bool]],
@@ -498,7 +558,7 @@ def analyse_transient(
     print("  (rate of change during the movement vs while holding still)\n")
     print(
         f"    {'metric':<17}{'down':>9}{'up':>9}{'quiet':>9}"
-        f"{'margin':>8}{'ok':>5}"
+        f"{'down/n':>8}{'up/n':>7}{'ok':>5}"
     )
 
     ranked: list[tuple[float, str, RateResult]] = []
@@ -508,15 +568,16 @@ def analyse_transient(
         )
         result = analyse_rates(series, cues, args.event_window, args.quiet_lead)
         if result is None:
-            print(f"    {name:<17}{'-':>9}{'-':>9}{'-':>9}{'-':>8}{'no':>5}")
+            print(f"    {name:<17}{'-':>9}{'-':>9}{'-':>9}{'-':>7}{'-':>7}{'no':>5}")
             continue
-        ok = result.clean and result.margin >= MIN_RATE_MARGIN
+        # Report the two directions separately: a strong press hidden behind a
+        # weak release is a very different problem from neither working.
         print(
             f"    {name:<17}{result.down_peak:>9.2f}{result.up_peak:>9.2f}"
-            f"{result.quiet_peak:>9.2f}{result.margin:>8.2f}"
-            f"{'YES' if ok else 'no':>5}"
+            f"{result.quiet_peak:>9.2f}{result.down_margin:>7.1f}x"
+            f"{result.up_margin:>6.1f}x{'YES' if result.clean else 'no':>5}"
         )
-        if ok:
+        if result.clean:
             ranked.append((result.margin, name, result))
 
     if args.metric:
@@ -569,6 +630,16 @@ def main() -> int:
     parser.add_argument("--fingers", default="index,middle")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
+        "--save",
+        default=None,
+        help="Where to write the raw recording (default: data/calibration_*.json).",
+    )
+    parser.add_argument(
+        "--analyse",
+        default=None,
+        help="Re-analyse a saved recording instead of using the camera.",
+    )
+    parser.add_argument(
         "--metric",
         default=None,
         help="Force a specific metric instead of picking the best one.",
@@ -597,6 +668,22 @@ def main() -> int:
     print("Sit exactly as you will when using the mouse. ESC aborts.\n")
 
     chosen: dict[str, tuple[str, float, float]] = {}
+    finger_data: dict[str, tuple[dict[str, list], list]] = {}
+
+    # Offline re-analysis: sweep parameters against a saved take instead of
+    # asking for another live performance of the gesture.
+    if args.analyse:
+        finger_data, _ = load_recording(Path(args.analyse))
+        print(f"Re-analysing {args.analyse}\n")
+        for finger, (recorded, cues) in finger_data.items():
+            if fingers and finger not in fingers:
+                continue
+            picked = analyse_transient(recorded, cues, finger, args)
+            if picked is not None:
+                chosen[finger] = picked
+        if args.dry_run or not chosen:
+            return 0 if chosen else 1
+        return write_config(chosen, fingers, args)
 
     try:
         with (
@@ -621,6 +708,8 @@ def main() -> int:
                     # Transient mode must keep the moment of movement.
                     settle=0.0 if args.mode == "transient" else args.settle,
                 )
+
+                finger_data[finger] = (recorded, cues)
 
                 if args.mode == "transient":
                     picked = analyse_transient(recorded, cues, finger, args)
@@ -716,6 +805,19 @@ def main() -> int:
         return 1
     finally:
         cv2.destroyAllWindows()
+        if finger_data:
+            save_recording(
+                Path(args.save or DEFAULT_RECORDING_DIR
+                     / f"calibration_{time.strftime('%Y%m%d_%H%M%S')}.json"),
+                finger_data,
+                {
+                    "mode": args.mode,
+                    "cycles": args.cycles,
+                    "rest_seconds": args.rest_seconds,
+                    "press_seconds": args.press_seconds,
+                    "camera": [settings.camera.width, settings.camera.height],
+                },
+            )
 
     if not chosen:
         print(
@@ -730,6 +832,18 @@ def main() -> int:
         )
         return 1
 
+    if args.dry_run:
+        print("\n--dry-run: config not written.")
+        return 0
+
+    return write_config(chosen, fingers, args)
+
+
+def write_config(
+    chosen: dict[str, tuple[str, float, float]],
+    fingers: list[str],
+    args: argparse.Namespace,
+) -> int:
     existing: dict = {}
     if USER_CONFIG_PATH.is_file():
         with USER_CONFIG_PATH.open("r", encoding="utf-8") as fh:
