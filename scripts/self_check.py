@@ -262,11 +262,59 @@ check("default selection is a known mode",
 
 print("\n[6] finger press state machine")
 from src.gestures.finger_state import (  # noqa: E402
+    BaselineTracker,
     PressDetector,
     PressEvent,
     PressState,
     PressThresholds,
 )
+
+# The baseline is what makes absolute drift harmless.
+tracker_b = BaselineTracker(time_constant=1.0)
+for i in range(200):
+    dev = tracker_b.update(100.0, 1 / 30, frozen=False)
+check("baseline converges to a constant input", abs(dev) < 0.01, f"dev={dev:.4f}")
+
+# Slow drift must stay bounded: a hand slowly changing posture is not a click.
+# A first-order lag tracking a ramp settles at a constant offset of
+# rate * time_constant, so the deviation plateaus instead of accumulating --
+# that bound is what keeps unlimited drift from ever reaching the threshold.
+DRIFT_RATE = 1.5  # units per second
+TIME_CONSTANT = 1.0
+tracker_b = BaselineTracker(time_constant=TIME_CONSTANT)
+value = 100.0
+worst = 0.0
+for i in range(600):  # 20 seconds; travels 30 units in total
+    value += DRIFT_RATE / 30
+    dev = tracker_b.update(value, 1 / 30, frozen=False)
+    if i > 90:  # let the lag settle first
+        worst = max(worst, abs(dev))
+expected = DRIFT_RATE * TIME_CONSTANT
+check(
+    "drift deviation plateaus at rate * time_constant",
+    abs(worst - expected) < 0.05,
+    f"worst {worst:.3f}, expected ~{expected:.3f}",
+)
+check(
+    "20s of drift stays far below a typical press threshold",
+    worst < 10.0 * 0.5,
+    f"worst {worst:.3f} after travelling {value - 100.0:.0f} units",
+)
+
+# A fast step must survive it: that is a press.
+tracker_b = BaselineTracker(time_constant=1.0)
+for _ in range(120):
+    tracker_b.update(100.0, 1 / 30, frozen=False)
+step = tracker_b.update(112.0, 1 / 30, frozen=False)
+check("baseline passes through a sudden step", step > 11.0, f"dev={step:.2f}")
+
+# Frozen baseline must not creep toward a held press.
+tracker_b = BaselineTracker(time_constant=1.0)
+tracker_b.update(100.0, 1 / 30, frozen=False)
+held = None
+for _ in range(300):  # 10 seconds of holding
+    held = tracker_b.update(115.0, 1 / 30, frozen=True)
+check("frozen baseline holds a long press", held > 14.9, f"dev after 10s = {held:.2f}")
 from src.tracking.hand_features import (  # noqa: E402
     PRESS_METRIC_NAMES,
     finger_flexion,
@@ -274,43 +322,85 @@ from src.tracking.hand_features import (  # noqa: E402
     press_metric,
 )
 
-THRESHOLDS = PressThresholds(press=40.0, release=25.0, min_state_duration=0.05)
+REST = 100.0
+FRAME = 1 / 30
 
 
-def fresh() -> PressDetector:
-    return PressDetector("index", PressThresholds(40.0, 25.0, 0.05))
+def primed(press_thr: float = 10.0, release_thr: float = 5.0):
+    """A detector with its baseline already settled at REST."""
+    detector = PressDetector(
+        "index", PressThresholds(press_thr, release_thr, 0.05), 1.0
+    )
+    t = 0.0
+    for _ in range(90):
+        t += FRAME
+        detector.update(REST, t)
+    return detector, t
 
 
-det = fresh()
-t = 1.0
+det, t = primed()
 check("starts UP", det.state is PressState.UP)
-check("below press threshold does nothing", det.update(10.0, t) is None)
+check("baseline settled at rest", abs(det.metric) < 0.05, f"dev={det.metric:.3f}")
 
-t += 0.1
-check("crossing press fires PRESSED", det.update(50.0, t) is PressEvent.PRESSED)
-t += 0.1
-check("staying pressed fires nothing", det.update(55.0, t) is None)
+t += FRAME
+check("small wobble does not press", det.update(REST + 3.0, t) is None)
+
+t += FRAME
+check(
+    "clear deviation fires PRESSED",
+    det.update(REST + 20.0, t) is PressEvent.PRESSED,
+    f"dev={det.metric:.2f}",
+)
+t += FRAME
+check("staying pressed fires nothing", det.update(REST + 22.0, t) is None)
 check("state remains DOWN while held", det.state is PressState.DOWN)
 
-# Hysteresis: a value between the two thresholds must NOT release.
-t += 0.1
-check("value inside hysteresis band does not release", det.update(30.0, t) is None)
+# Hysteresis: between the two thresholds must NOT release.
+t += FRAME
+check("value inside hysteresis band does not release", det.update(REST + 7.0, t) is None)
 check("still DOWN inside the band", det.state is PressState.DOWN)
 
-t += 0.1
-check("crossing release fires RELEASED", det.update(20.0, t) is PressEvent.RELEASED)
-t += 0.1
-check("staying up fires nothing", det.update(15.0, t) is None)
+t += FRAME
+check(
+    "returning to rest fires RELEASED",
+    det.update(REST + 1.0, t) is PressEvent.RELEASED,
+)
+t += FRAME
+check("staying up fires nothing", det.update(REST, t) is None)
 
-# Chatter: oscillating across a single threshold must not machine-gun clicks
-# once debounce is accounted for.
-det = fresh()
+# A long hold must not decay away as the baseline creeps up to meet it.
+det, t = primed()
+t += FRAME
+det.update(REST + 20.0, t)
+released_early = False
+for _ in range(300):  # 10 seconds held
+    t += FRAME
+    if det.update(REST + 20.0, t) is PressEvent.RELEASED:
+        released_early = True
+check("a 10-second hold does not self-release", not released_early)
+check("still DOWN after 10s", det.state is PressState.DOWN)
+
+# Slow posture drift must never click, however far it travels.
+det, t = primed()
+value = REST
+spurious = 0
+for _ in range(600):  # 20s of steady drift
+    t += FRAME
+    value += 0.05
+    if det.update(value, t) is not None:
+        spurious += 1
+check(
+    "slow posture drift produces no clicks",
+    spurious == 0,
+    f"{spurious} events over 20s of drift ({value - REST:.0f} units travelled)",
+)
+
+# Chatter across the press threshold must be debounced.
+det, t = primed()
 events = []
-t = 10.0
 for i in range(200):
     t += 0.005  # 200 Hz, far faster than the 0.05s debounce
-    value = 41.0 if i % 2 == 0 else 39.0
-    event = det.update(value, t)
+    event = det.update(REST + (11.0 if i % 2 == 0 else 9.0), t)
     if event is not None:
         events.append(event)
 check(
@@ -320,20 +410,20 @@ check(
 )
 
 # Forced release, the tracking-loss path.
-det = fresh()
-det.update(50.0, 20.0)
+det, t = primed()
+t += FRAME
+det.update(REST + 20.0, t)
 check("forced release from DOWN reports RELEASED",
-      det.force_release(20.1) is PressEvent.RELEASED)
+      det.force_release(t + 0.1) is PressEvent.RELEASED)
 check("forced release leaves state UP", det.state is PressState.UP)
-check("forced release from UP reports nothing", det.force_release(20.2) is None)
+check("forced release from UP reports nothing", det.force_release(t + 0.2) is None)
 
 # A press/release pair must always balance, or a button leaks.
-det = fresh()
-t = 30.0
+det, t = primed()
 balance = 0
-for value in (10, 50, 55, 52, 20, 12, 60, 58, 10, 45, 50):
+for offset in (0, 20, 22, 21, 1, 0, 25, 24, 0, 18, 20):
     t += 0.1
-    event = det.update(float(value), t)
+    event = det.update(REST + offset, t)
     if event is PressEvent.PRESSED:
         balance += 1
     elif event is PressEvent.RELEASED:
@@ -341,6 +431,14 @@ for value in (10, 50, 55, 52, 20, 12, 60, 58, 10, 45, 50):
 if det.force_release(t + 0.1) is PressEvent.RELEASED:
     balance -= 1
 check("presses and releases balance to zero", balance == 0, f"balance={balance}")
+
+# reset() must clear the baseline so a reacquired hand relearns it.
+det, t = primed()
+det.reset()
+check("reset clears the baseline", det.baseline is None)
+t += FRAME
+det.update(500.0, t)
+check("first sample after reset is zero deviation", abs(det.metric) < 1e-9)
 
 # Inverted thresholds must be rejected, not silently accepted.
 try:

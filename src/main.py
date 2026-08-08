@@ -158,7 +158,14 @@ class AirPodsMouseApp:
                 min_state_duration=gestures.min_state_duration,
             )
             try:
-                detectors[finger] = (PressDetector(finger, thresholds), button)
+                detectors[finger] = (
+                    PressDetector(
+                        finger,
+                        thresholds,
+                        baseline_time_constant=gestures.baseline_time_constant,
+                    ),
+                    button,
+                )
             except ValueError as exc:
                 # An uncalibrated or inverted pair would otherwise click wildly.
                 log.error("%s -- %s clicking disabled", exc, finger)
@@ -258,9 +265,12 @@ class AirPodsMouseApp:
             if hand is not None:
                 if not self._had_hand:
                     log.info("Right hand acquired")
-                    # Fresh acquisition: start from this position, no delta.
+                    # Fresh acquisition: start from this position, no delta,
+                    # and re-learn each finger's resting baseline from scratch.
                     self._mapper.reset()
                     self._mouse.reset_residual()
+                    for detector, _ in self._press_detectors.values():
+                        detector.reset()
                 self._had_hand = True
                 self._last_hand_time = time.perf_counter()
 

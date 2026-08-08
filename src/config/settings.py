@@ -160,6 +160,13 @@ class GestureSettings:
     # Minimum seconds between state changes, to debounce a single noisy frame.
     min_state_duration: float = 0.05
 
+    # How fast the resting baseline follows the finger, in seconds. Thresholds
+    # are measured against deviation from this, not the raw metric, because
+    # resting posture drifts by more than a press changes anything.
+    # Shorter = adapts to posture faster but starts ignoring slow presses;
+    # longer = holds a press better but reacts to posture changes sluggishly.
+    baseline_time_constant: float = 1.0
+
 
 @dataclass
 class DebugSettings:

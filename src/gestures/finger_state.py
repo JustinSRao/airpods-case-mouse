@@ -29,6 +29,49 @@ class PressState(Enum):
     DOWN = "DOWN"
 
 
+class BaselineTracker:
+    """Slow-moving estimate of a finger's *resting* metric value.
+
+    Absolute thresholds do not work here. Measured on a real hand, the resting
+    value of every candidate metric drifts by more than a press changes it --
+    posture shifts over a few seconds swamp the signal. What is stable is the
+    *deviation* from where the finger has been sitting recently.
+
+    The baseline is frozen while the finger is down. Otherwise it would climb
+    to meet the pressed value and the press would "fade out" during a long
+    drag, releasing on its own.
+    """
+
+    def __init__(self, time_constant: float) -> None:
+        if time_constant <= 0:
+            raise ValueError(f"time_constant must be positive, got {time_constant}")
+        self._time_constant = time_constant
+        self._baseline: float | None = None
+
+    @property
+    def value(self) -> float | None:
+        return self._baseline
+
+    @property
+    def ready(self) -> bool:
+        return self._baseline is not None
+
+    def update(self, metric: float, dt: float, frozen: bool) -> float:
+        """Advance the baseline and return the current deviation from it."""
+        if self._baseline is None:
+            self._baseline = metric
+            return 0.0
+        if not frozen and dt > 0:
+            # Standard first-order lag: alpha rises with dt, so the smoothing
+            # is frame-rate independent.
+            alpha = dt / (self._time_constant + dt)
+            self._baseline += alpha * (metric - self._baseline)
+        return metric - self._baseline
+
+    def reset(self) -> None:
+        self._baseline = None
+
+
 class PressEvent(Enum):
     """Emitted only on the frame the state actually changes."""
 
@@ -38,7 +81,7 @@ class PressEvent(Enum):
 
 @dataclass
 class PressThresholds:
-    """Thresholds in whatever units the active metric uses.
+    """Deviation-from-baseline thresholds for one finger.
 
     ``press`` must be strictly greater than ``release``; the gap between them
     is the hysteresis band.
@@ -58,15 +101,27 @@ class PressThresholds:
 
 
 class PressDetector:
-    """Tracks one finger's press state from a scalar metric."""
+    """Tracks one finger's press state from its deviation off a baseline.
 
-    def __init__(self, name: str, thresholds: PressThresholds) -> None:
+    Thresholds are in *deviation* units, not raw metric units: how far the
+    finger has moved from where it has been resting, not where it is.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        thresholds: PressThresholds,
+        baseline_time_constant: float = 1.0,
+    ) -> None:
         thresholds.validate(name)
         self._name = name
         self._thresholds = thresholds
+        self._baseline = BaselineTracker(baseline_time_constant)
         self._state = PressState.UP
         self._last_change = 0.0
-        self._metric = 0.0
+        self._last_update: float | None = None
+        self._deviation = 0.0
+        self._raw = 0.0
 
     @property
     def state(self) -> PressState:
@@ -74,32 +129,56 @@ class PressDetector:
 
     @property
     def metric(self) -> float:
-        """Last metric value seen, for the debug HUD."""
-        return self._metric
+        """Current deviation from baseline -- what the thresholds compare to."""
+        return self._deviation
+
+    @property
+    def raw_metric(self) -> float:
+        return self._raw
+
+    @property
+    def baseline(self) -> float | None:
+        return self._baseline.value
 
     @property
     def thresholds(self) -> PressThresholds:
         return self._thresholds
 
     def update(self, metric: float, now: float) -> PressEvent | None:
-        """Feed one frame's metric; returns an event only on a transition."""
-        self._metric = metric
+        """Feed one frame's raw metric; returns an event only on a transition."""
+        dt = 0.0 if self._last_update is None else max(now - self._last_update, 0.0)
+        self._last_update = now
+        self._raw = metric
+
+        # Freeze the baseline while pressed, so a long hold cannot decay away.
+        self._deviation = self._baseline.update(
+            metric, dt, frozen=self._state is PressState.DOWN
+        )
 
         # Debounce: refuse to change state again too soon after the last one.
         if now - self._last_change < self._thresholds.min_state_duration:
             return None
 
-        if self._state is PressState.UP and metric > self._thresholds.press:
+        if self._state is PressState.UP and self._deviation > self._thresholds.press:
             self._state = PressState.DOWN
             self._last_change = now
             return PressEvent.PRESSED
 
-        if self._state is PressState.DOWN and metric < self._thresholds.release:
+        if (
+            self._state is PressState.DOWN
+            and self._deviation < self._thresholds.release
+        ):
             self._state = PressState.UP
             self._last_change = now
             return PressEvent.RELEASED
 
         return None
+
+    def reset(self) -> None:
+        """Forget the baseline (call when tracking is lost and reacquired)."""
+        self._baseline.reset()
+        self._last_update = None
+        self._deviation = 0.0
 
     def force_release(self, now: float) -> PressEvent | None:
         """Drop to UP regardless of thresholds or debounce.

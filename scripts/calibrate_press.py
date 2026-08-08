@@ -30,6 +30,7 @@ import cv2
 
 from src.camera.camera_manager import CameraManager
 from src.config.settings import USER_CONFIG_PATH, AppSettings
+from src.gestures.finger_state import BaselineTracker
 from src.tracking.hand_features import PRESS_METRIC_NAMES, press_metric
 from src.tracking.hand_tracker import HandTracker
 
@@ -54,58 +55,87 @@ def percentile(ordered: list[float], fraction: float) -> float:
     return ordered[index]
 
 
-def collect(
+def run_cycles(
     camera: CameraManager,
     tracker: HandTracker,
-    prompt: str,
-    subtitle: str,
-    seconds: float,
     finger: str,
     start_time: float,
-) -> dict[str, list[float]]:
-    """Record every candidate metric for a fixed duration."""
-    samples: dict[str, list[float]] = {name: [] for name in PRESS_METRIC_NAMES}
-    deadline = time.perf_counter() + seconds
+    cycles: int,
+    rest_seconds: float,
+    press_seconds: float,
+    settle: float,
+) -> dict[str, list[tuple[float, float, bool]]]:
+    """Alternate REST and PRESS several times, recording every metric.
 
-    while True:
-        remaining = deadline - time.perf_counter()
-        if remaining <= 0:
-            break
-        frame = camera.read()
-        if frame is None:
-            continue
+    Cycling rather than one long phase of each is deliberate: it exercises the
+    baseline the same way real use does, and repeated transitions expose a
+    press that a single sustained hold would let the baseline absorb.
 
-        hand = tracker.select_hand(
-            tracker.process(frame, int((time.perf_counter() - start_time) * 1000))
-        )
-        if hand is not None:
-            for name in PRESS_METRIC_NAMES:
-                samples[name].append(press_metric(hand.world_landmarks, finger, name))
+    Frames within ``settle`` seconds of a phase change are dropped, since the
+    hand is mid-transition and belongs to neither class.
+    """
+    recorded: dict[str, list[tuple[float, float, bool]]] = {
+        name: [] for name in PRESS_METRIC_NAMES
+    }
 
-        count = len(samples[PRESS_METRIC_NAMES[0]])
-        cv2.rectangle(frame, (0, 0), (frame.shape[1], 96), (25, 25, 25), -1)
-        cv2.putText(frame, prompt, (10, 26), _FONT, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(frame, subtitle, (10, 52), _FONT, 0.5, (0, 190, 255), 1, cv2.LINE_AA)
-        status = (
-            f"{remaining:4.1f}s   samples {count:4d}"
-            if hand is not None
-            else f"{remaining:4.1f}s   NO HAND DETECTED"
-        )
-        cv2.putText(
-            frame,
-            status,
-            (10, 80),
-            _FONT,
-            0.55,
-            (80, 220, 100) if hand is not None else (60, 60, 240),
-            1,
-            cv2.LINE_AA,
-        )
-        cv2.imshow("Calibration", frame)
-        if cv2.waitKey(1) & 0xFF == 27:
-            raise KeyboardInterrupt
+    schedule: list[tuple[str, float, bool]] = []
+    for _ in range(cycles):
+        schedule.append(("RELAX - do not press", rest_seconds, False))
+        schedule.append(("PRESS DOWN now", press_seconds, True))
 
-    return samples
+    for label, duration, pressing in schedule:
+        phase_start = time.perf_counter()
+        deadline = phase_start + duration
+        while True:
+            now = time.perf_counter()
+            remaining = deadline - now
+            if remaining <= 0:
+                break
+            frame = camera.read()
+            if frame is None:
+                continue
+
+            hand = tracker.select_hand(
+                tracker.process(frame, int((now - start_time) * 1000))
+            )
+            in_settle = (now - phase_start) < settle
+            if hand is not None and not in_settle:
+                for name in PRESS_METRIC_NAMES:
+                    recorded[name].append(
+                        (
+                            now,
+                            press_metric(hand.world_landmarks, finger, name),
+                            pressing,
+                        )
+                    )
+
+            banner = (60, 40, 140) if pressing else (40, 40, 40)
+            cv2.rectangle(frame, (0, 0), (frame.shape[1], 96), banner, -1)
+            cv2.putText(
+                frame,
+                f"[{finger}]  {label}",
+                (10, 34),
+                _FONT,
+                0.7,
+                (255, 255, 255),
+                2,
+                cv2.LINE_AA,
+            )
+            if hand is None:
+                status, colour = "NO HAND DETECTED", (60, 60, 240)
+            elif in_settle:
+                status, colour = f"{remaining:4.1f}s  (settling)", (0, 190, 255)
+            else:
+                status, colour = (
+                    f"{remaining:4.1f}s  recording",
+                    (80, 220, 100),
+                )
+            cv2.putText(frame, status, (10, 74), _FONT, 0.6, colour, 1, cv2.LINE_AA)
+            cv2.imshow("Calibration", frame)
+            if cv2.waitKey(1) & 0xFF == 27:
+                raise KeyboardInterrupt
+
+    return recorded
 
 
 def countdown(camera: CameraManager, message: str, seconds: float = 3.0) -> None:
@@ -132,6 +162,35 @@ def countdown(camera: CameraManager, message: str, seconds: float = 3.0) -> None
         cv2.imshow("Calibration", frame)
         if cv2.waitKey(1) & 0xFF == 27:
             raise KeyboardInterrupt
+
+
+def replay_deviations(
+    samples: list[tuple[float, float, bool]], time_constant: float
+) -> tuple[list[float], list[float]]:
+    """Re-run the runtime baseline algorithm over recorded samples.
+
+    ``samples`` is (timestamp, raw_metric, is_press_phase). Returns the
+    deviations seen during rest and during press, so the thresholds are
+    derived from exactly the quantity the detector will compare at runtime
+    rather than from raw values it never sees.
+    """
+    tracker = BaselineTracker(time_constant)
+    rest_dev: list[float] = []
+    press_dev: list[float] = []
+    previous_time: float | None = None
+    was_pressing = False
+
+    for timestamp, value, pressing in samples:
+        dt = 0.0 if previous_time is None else max(timestamp - previous_time, 0.0)
+        previous_time = timestamp
+
+        # Freeze exactly as the detector does once a press is under way.
+        deviation = tracker.update(value, dt, frozen=was_pressing)
+        was_pressing = pressing
+
+        (press_dev if pressing else rest_dev).append(deviation)
+
+    return rest_dev, press_dev
 
 
 class MetricScore:
@@ -182,8 +241,16 @@ class MetricScore:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--rest-seconds", type=float, default=5.0)
-    parser.add_argument("--press-seconds", type=float, default=5.0)
+    parser.add_argument("--rest-seconds", type=float, default=2.5)
+    parser.add_argument("--press-seconds", type=float, default=2.0)
+    parser.add_argument("--cycles", type=int, default=4)
+    parser.add_argument(
+        "--settle",
+        type=float,
+        default=0.6,
+        help="Seconds discarded after each phase change (reaction time).",
+    )
+    parser.add_argument("--baseline-time-constant", type=float, default=None)
     parser.add_argument("--fingers", default="index,middle")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -197,8 +264,11 @@ def main() -> int:
 
     settings = AppSettings.load()
     fingers = [f.strip() for f in args.fingers.split(",") if f.strip()]
+    if args.baseline_time_constant is None:
+        args.baseline_time_constant = settings.gestures.baseline_time_constant
 
     print(f"\nCalibrating: {', '.join(fingers)}")
+    print(f"{args.cycles} relax/press cycles per finger. Follow the banner.")
     print("Sit exactly as you will when using the mouse. ESC aborts.\n")
 
     chosen: dict[str, tuple[str, float, float]] = {}
@@ -210,39 +280,37 @@ def main() -> int:
         ):
             start_time = time.perf_counter()
             for finger in fingers:
-                countdown(camera, f"[{finger}]  REST - relax, do NOT press")
-                rest = collect(
+                countdown(
+                    camera,
+                    f"[{finger}]  follow the banner: relax / press, x{args.cycles}",
+                    4.0,
+                )
+                recorded = run_cycles(
                     camera,
                     tracker,
-                    f"[{finger}]  REST",
-                    "relax the finger, do NOT press",
-                    args.rest_seconds,
                     finger,
                     start_time,
+                    cycles=args.cycles,
+                    rest_seconds=args.rest_seconds,
+                    press_seconds=args.press_seconds,
+                    settle=args.settle,
                 )
 
-                countdown(camera, f"[{finger}]  PRESS - hold it DOWN the whole time")
-                press = collect(
-                    camera,
-                    tracker,
-                    f"[{finger}]  PRESS and HOLD",
-                    "keep it pressed for the whole phase",
-                    args.press_seconds,
-                    finger,
-                    start_time,
-                )
+                scores = []
+                for name in PRESS_METRIC_NAMES:
+                    rest_dev, press_dev = replay_deviations(
+                        recorded[name], args.baseline_time_constant
+                    )
+                    if len(rest_dev) >= 20 and len(press_dev) >= 20:
+                        scores.append(MetricScore(name, rest_dev, press_dev))
 
-                n_rest = len(rest[PRESS_METRIC_NAMES[0]])
-                n_press = len(press[PRESS_METRIC_NAMES[0]])
+                n_rest = sum(1 for s in recorded[PRESS_METRIC_NAMES[0]] if not s[2])
+                n_press = sum(1 for s in recorded[PRESS_METRIC_NAMES[0]] if s[2])
                 print(f"\n  {finger}: {n_rest} rest samples, {n_press} press samples")
-                if n_rest < 20 or n_press < 20:
+                print("  (thresholds are deviation from the rolling baseline)")
+                if not scores:
                     print("    !! too few samples - was the hand tracked throughout?")
                     continue
-
-                scores = [
-                    MetricScore(name, rest[name], press[name])
-                    for name in PRESS_METRIC_NAMES
-                ]
                 scores.sort(key=lambda s: s.normalised_gap, reverse=True)
                 for score in scores:
                     print(score.row())

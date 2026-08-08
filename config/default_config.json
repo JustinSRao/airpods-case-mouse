@@ -43,7 +43,8 @@
     "index_release_threshold": 0.0,
     "middle_press_threshold": 0.0,
     "middle_release_threshold": 0.0,
-    "min_state_duration": 0.05
+    "min_state_duration": 0.05,
+    "baseline_time_constant": 1.0
   },
   "debug": {
     "show_preview": true,
