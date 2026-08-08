@@ -47,6 +47,10 @@ RELEASE_FRACTION = 0.30
 REST_TAIL = 0.95
 PRESS_TAIL = 0.05
 
+# Cap on the timestep used when replaying the baseline, so gaps left by
+# discarded settle frames cannot advance it in one large jump.
+MAX_REPLAY_DT = 1.0 / 25.0
+
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
@@ -178,15 +182,19 @@ def replay_deviations(
     rest_dev: list[float] = []
     press_dev: list[float] = []
     previous_time: float | None = None
-    was_pressing = False
 
     for timestamp, value, pressing in samples:
         dt = 0.0 if previous_time is None else max(timestamp - previous_time, 0.0)
         previous_time = timestamp
+        # Settle frames are discarded, so consecutive timestamps can straddle
+        # a long gap. Feeding that raw would advance the baseline by a huge
+        # alpha in one step -- right at a phase change, which is exactly where
+        # it would swallow the press. Treat the recording as continuous.
+        dt = min(dt, MAX_REPLAY_DT)
 
-        # Freeze exactly as the detector does once a press is under way.
-        deviation = tracker.update(value, dt, frozen=was_pressing)
-        was_pressing = pressing
+        # Freeze on THIS sample's label. Using the previous one let the
+        # baseline take one un-frozen step toward the already-pressed value.
+        deviation = tracker.update(value, dt, frozen=pressing)
 
         (press_dev if pressing else rest_dev).append(deviation)
 

@@ -452,6 +452,46 @@ try:
 except ValueError:
     check("zero (uncalibrated) thresholds rejected", True)
 
+print("\n[6b] calibration replay recovers a press buried in drift")
+from scripts.calibrate_press import MetricScore, replay_deviations  # noqa: E402
+
+# Mirrors real measured behaviour: a press worth ~9 units sitting on top of
+# slow posture drift and frame noise, with settle frames discarded so the
+# timestamps contain gaps. A regression here means calibration silently
+# reports OVERLAP on a signal that is genuinely present.
+_rng = np.random.default_rng(7)
+_samples = []
+_t = 0.0
+_drift = 0.0
+for _cycle in range(4):
+    for _duration, _pressing in ((2.5, False), (2.0, True)):
+        _phase_start = _t
+        while _t - _phase_start < _duration:
+            _drift += 1.2 / 30.0
+            _value = 105.0 + _drift + _rng.normal(0, 2.0) + (9.0 if _pressing else 0.0)
+            if (_t - _phase_start) >= 0.6:
+                _samples.append((_t, _value, _pressing))
+            _t += 1.0 / 30.0
+
+_rest_dev, _press_dev = replay_deviations(_samples, 1.0)
+_score = MetricScore("synthetic", _rest_dev, _press_dev)
+check(
+    "replay separates a 9-unit press from drift",
+    _score.usable,
+    f"gap={_score.gap:.2f} d'={_score.dprime:.2f}",
+)
+check(
+    "replay recovers most of the true press amplitude",
+    _score.press_median > 9.0 * 0.75,
+    f"recovered {_score.press_median:.2f} of 9.00",
+)
+check(
+    "derived thresholds sit between the two states",
+    _score.thresholds()[1] > _score.rest_tail
+    and _score.thresholds()[0] < _score.press_tail,
+    f"thresholds={_score.thresholds()}",
+)
+
 print("\n[7] press metrics from landmarks")
 # A straight finger has ~zero flexion; a curled one has much more.
 straight = np.zeros((21, 3), dtype=np.float32)
