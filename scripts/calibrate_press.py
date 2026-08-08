@@ -37,6 +37,7 @@ from src.gestures.finger_state import (
     PressState,
     PressStateMachine,
     PressThresholds,
+    RateTracker,
 )
 from src.tracking.hand_features import PRESS_METRIC_NAMES, press_metric
 from src.tracking.hand_tracker import HandTracker
@@ -66,6 +67,14 @@ MAX_REPLAY_DT = 1.0 / 25.0
 # genuine signal (measured d' ~3 at 720p) untouched.
 MIN_DPRIME = 1.5
 
+# Where the rate threshold sits between quiet noise and the weakest observed
+# transient. Biased low-ish so a soft press still registers, but the clean
+# test still requires it to clear the noise ceiling outright.
+RATE_FRACTION = 0.45
+
+# A transient must beat quiet noise by at least this factor to be trusted.
+MIN_RATE_MARGIN = 2.5
+
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
@@ -83,8 +92,8 @@ def run_cycles(
     rest_seconds: float,
     press_seconds: float,
     settle: float,
-) -> dict[str, list[tuple[float, float, bool]]]:
-    """Alternate REST and PRESS several times, recording every metric.
+) -> tuple[dict[str, list[tuple[float, float, bool]]], list[tuple[float, bool]]]:
+    """Alternate RELEASE and PRESS several times, recording every metric.
 
     Cycling rather than one long phase of each is deliberate: it exercises the
     baseline the same way real use does, and repeated transitions expose a
@@ -96,14 +105,16 @@ def run_cycles(
     recorded: dict[str, list[tuple[float, float, bool]]] = {
         name: [] for name in PRESS_METRIC_NAMES
     }
+    cues: list[tuple[float, bool]] = []
 
     schedule: list[tuple[str, float, bool]] = []
     for _ in range(cycles):
-        schedule.append(("RELAX - do not press", rest_seconds, False))
-        schedule.append(("PRESS DOWN now", press_seconds, True))
+        schedule.append(("RELEASE - lift the finger off", rest_seconds, False))
+        schedule.append(("PRESS - lift then press down", press_seconds, True))
 
     for label, duration, pressing in schedule:
         phase_start = time.perf_counter()
+        cues.append((phase_start, pressing))
         deadline = phase_start + duration
         while True:
             now = time.perf_counter()
@@ -117,7 +128,10 @@ def run_cycles(
             hand = tracker.select_hand(
                 tracker.process(frame, int((now - start_time) * 1000))
             )
-            in_settle = (now - phase_start) < settle
+            # Transient mode needs the moment of movement, which is exactly
+            # what the settle window used to throw away. Keep every frame and
+            # let the analysis decide which part of each phase to use.
+            in_settle = settle > 0 and (now - phase_start) < settle
             if hand is not None and not in_settle:
                 for name in PRESS_METRIC_NAMES:
                     recorded[name].append(
@@ -159,7 +173,7 @@ def run_cycles(
             if cv2.waitKey(1) & 0xFF == 27:
                 raise KeyboardInterrupt
 
-    return recorded
+    return recorded, cues
 
 
 def countdown(camera: CameraManager, message: str, seconds: float = 3.0) -> None:
@@ -310,6 +324,90 @@ def simulate(
     )
 
 
+def replay_rates(
+    samples: list[tuple[float, float, bool]],
+    signal_tc: float,
+    rate_tc: float,
+) -> list[tuple[float, float, bool]]:
+    """Re-run the runtime rate tracker over recorded samples."""
+    tracker = RateTracker(signal_tc, rate_tc)
+    series: list[tuple[float, float, bool]] = []
+    previous_time: float | None = None
+    for timestamp, value, pressing in samples:
+        dt = 0.0 if previous_time is None else max(timestamp - previous_time, 0.0)
+        previous_time = timestamp
+        series.append((timestamp, tracker.update(value, min(dt, MAX_REPLAY_DT)), pressing))
+    return series
+
+
+@dataclass
+class RateResult:
+    """Thresholds for transient mode plus how well they separate."""
+
+    press: float
+    release: float
+    down_peak: float
+    up_peak: float
+    quiet_peak: float
+
+    @property
+    def clean(self) -> bool:
+        return self.press > self.quiet_peak and -self.release > self.quiet_peak
+
+    @property
+    def margin(self) -> float:
+        """Smallest headroom between a real transient and quiet noise."""
+        return min(self.down_peak, self.up_peak) / max(self.quiet_peak, 1e-9)
+
+
+def analyse_rates(
+    series: list[tuple[float, float, bool]],
+    events: list[tuple[float, bool]],
+    event_window: float,
+    quiet_lead: float,
+) -> RateResult | None:
+    """Compare rate during cued transients against rate while holding still.
+
+    ``events`` is (cue_time, is_press). Within ``event_window`` seconds of a
+    cue the finger is moving; ``quiet_lead`` seconds before the next cue it is
+    settled. Thresholds go between the two.
+    """
+    down_peaks: list[float] = []
+    up_peaks: list[float] = []
+    quiet: list[float] = []
+
+    for index, (cue_time, is_press) in enumerate(events):
+        next_cue = events[index + 1][0] if index + 1 < len(events) else float("inf")
+        window = [
+            rate
+            for t, rate, _ in series
+            if cue_time <= t < min(cue_time + event_window, next_cue)
+        ]
+        settled = [
+            rate for t, rate, _ in series if next_cue - quiet_lead <= t < next_cue
+        ]
+        if not window:
+            continue
+        # A press should drive the rate positive, a release negative.
+        (down_peaks if is_press else up_peaks).append(
+            max(window) if is_press else -min(window)
+        )
+        quiet.extend(abs(rate) for rate in settled)
+
+    if not down_peaks or not up_peaks or len(quiet) < 20:
+        return None
+
+    # Use the weakest transient, not the average: the threshold has to catch
+    # the softest press the user actually makes.
+    down_peak = min(down_peaks)
+    up_peak = min(up_peaks)
+    quiet_peak = percentile(sorted(quiet), 0.99)
+
+    press = quiet_peak + (down_peak - quiet_peak) * RATE_FRACTION
+    release = -(quiet_peak + (up_peak - quiet_peak) * RATE_FRACTION)
+    return RateResult(press, release, down_peak, up_peak, quiet_peak)
+
+
 def best_thresholds(
     series: list[tuple[float, float, bool]], min_state_duration: float
 ) -> ThresholdResult | None:
@@ -389,6 +487,56 @@ class MetricScore:
         )
 
 
+def analyse_transient(
+    recorded: dict[str, list[tuple[float, float, bool]]],
+    cues: list[tuple[float, bool]],
+    finger: str,
+    args: argparse.Namespace,
+) -> tuple[str, float, float] | None:
+    """Rank metrics by how far their movement rate clears quiet noise."""
+    print(f"\n  {finger}: {len(cues)} cued transients")
+    print("  (rate of change during the movement vs while holding still)\n")
+    print(
+        f"    {'metric':<17}{'down':>9}{'up':>9}{'quiet':>9}"
+        f"{'margin':>8}{'ok':>5}"
+    )
+
+    ranked: list[tuple[float, str, RateResult]] = []
+    for name in PRESS_METRIC_NAMES:
+        series = replay_rates(
+            recorded[name], args.rate_signal_time_constant, args.rate_time_constant
+        )
+        result = analyse_rates(series, cues, args.event_window, args.quiet_lead)
+        if result is None:
+            print(f"    {name:<17}{'-':>9}{'-':>9}{'-':>9}{'-':>8}{'no':>5}")
+            continue
+        ok = result.clean and result.margin >= MIN_RATE_MARGIN
+        print(
+            f"    {name:<17}{result.down_peak:>9.2f}{result.up_peak:>9.2f}"
+            f"{result.quiet_peak:>9.2f}{result.margin:>8.2f}"
+            f"{'YES' if ok else 'no':>5}"
+        )
+        if ok:
+            ranked.append((result.margin, name, result))
+
+    if args.metric:
+        ranked = [r for r in ranked if r[1] == args.metric]
+    if not ranked:
+        print(
+            f"    !! {finger}: no metric's movement clears the noise by "
+            f"{MIN_RATE_MARGIN}x."
+        )
+        return None
+
+    ranked.sort(reverse=True)
+    margin, name, result = ranked[0]
+    print(
+        f"\n    -> '{name}': press rate > {result.press:.3f}, "
+        f"release rate < {result.release:.3f}   (margin {margin:.1f}x noise)"
+    )
+    return (name, result.press, result.release)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rest-seconds", type=float, default=2.5)
@@ -403,6 +551,21 @@ def main() -> int:
     parser.add_argument("--baseline-time-constant", type=float, default=None)
     parser.add_argument("--signal-time-constant", type=float, default=None)
     parser.add_argument("--min-state-duration", type=float, default=None)
+    parser.add_argument("--mode", choices=("transient", "level"), default=None)
+    parser.add_argument("--rate-signal-time-constant", type=float, default=None)
+    parser.add_argument("--rate-time-constant", type=float, default=None)
+    parser.add_argument(
+        "--event-window",
+        type=float,
+        default=1.0,
+        help="Seconds after each cue in which the movement is expected.",
+    )
+    parser.add_argument(
+        "--quiet-lead",
+        type=float,
+        default=0.7,
+        help="Seconds before the next cue treated as settled/still.",
+    )
     parser.add_argument("--fingers", default="index,middle")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -422,6 +585,12 @@ def main() -> int:
         args.signal_time_constant = settings.gestures.signal_time_constant
     if args.min_state_duration is None:
         args.min_state_duration = settings.gestures.min_state_duration
+    if args.mode is None:
+        args.mode = settings.gestures.mode
+    if args.rate_signal_time_constant is None:
+        args.rate_signal_time_constant = settings.gestures.rate_signal_time_constant
+    if args.rate_time_constant is None:
+        args.rate_time_constant = settings.gestures.rate_time_constant
 
     print(f"\nCalibrating: {', '.join(fingers)}")
     print(f"{args.cycles} relax/press cycles per finger. Follow the banner.")
@@ -441,7 +610,7 @@ def main() -> int:
                     f"[{finger}]  follow the banner: relax / press, x{args.cycles}",
                     4.0,
                 )
-                recorded = run_cycles(
+                recorded, cues = run_cycles(
                     camera,
                     tracker,
                     finger,
@@ -449,8 +618,15 @@ def main() -> int:
                     cycles=args.cycles,
                     rest_seconds=args.rest_seconds,
                     press_seconds=args.press_seconds,
-                    settle=args.settle,
+                    # Transient mode must keep the moment of movement.
+                    settle=0.0 if args.mode == "transient" else args.settle,
                 )
+
+                if args.mode == "transient":
+                    picked = analyse_transient(recorded, cues, finger, args)
+                    if picked is not None:
+                        chosen[finger] = picked
+                    continue
 
                 n_rest = sum(1 for s in recorded[PRESS_METRIC_NAMES[0]] if not s[2])
                 n_press = sum(1 for s in recorded[PRESS_METRIC_NAMES[0]] if s[2])
@@ -560,10 +736,15 @@ def main() -> int:
             existing = json.load(fh)
 
     gestures = existing.setdefault("gestures", {})
-    for finger, (metric, press_threshold, release_threshold) in chosen.items():
+    gestures["mode"] = args.mode
+    for finger, (metric, press_value, release_value) in chosen.items():
         gestures[f"{finger}_metric"] = metric
-        gestures[f"{finger}_press_threshold"] = round(press_threshold, 3)
-        gestures[f"{finger}_release_threshold"] = round(release_threshold, 3)
+        if args.mode == "transient":
+            gestures[f"{finger}_press_rate"] = round(press_value, 4)
+            gestures[f"{finger}_release_rate"] = round(release_value, 4)
+        else:
+            gestures[f"{finger}_press_threshold"] = round(press_value, 3)
+            gestures[f"{finger}_release_threshold"] = round(release_value, 3)
     gestures["enabled"] = len(chosen) == len(fingers)
 
     USER_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)

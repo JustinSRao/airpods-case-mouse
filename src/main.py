@@ -47,6 +47,8 @@ from src.gestures.finger_state import (
     PressEvent,
     PressState,
     PressThresholds,
+    RateThresholds,
+    TransientPressDetector,
 )
 from src.mouse.mouse_controller import (
     MouseButton,
@@ -147,37 +149,52 @@ class AirPodsMouseApp:
             )
             return {}
 
-        detectors: dict[str, tuple[PressDetector, MouseButton]] = {}
+        detectors: dict[str, tuple[object, MouseButton]] = {}
         for finger, button in (
             ("index", MouseButton.LEFT),
             ("middle", MouseButton.RIGHT),
         ):
-            thresholds = PressThresholds(
-                press=getattr(gestures, f"{finger}_press_threshold"),
-                release=getattr(gestures, f"{finger}_release_threshold"),
-                min_state_duration=gestures.min_state_duration,
-            )
             try:
-                detectors[finger] = (
-                    PressDetector(
+                if gestures.mode == "transient":
+                    detector = TransientPressDetector(
                         finger,
-                        thresholds,
+                        RateThresholds(
+                            press=getattr(gestures, f"{finger}_press_rate"),
+                            release=getattr(gestures, f"{finger}_release_rate"),
+                            min_state_duration=gestures.min_state_duration,
+                        ),
+                        signal_time_constant=gestures.rate_signal_time_constant,
+                        rate_time_constant=gestures.rate_time_constant,
+                    )
+                elif gestures.mode == "level":
+                    detector = PressDetector(
+                        finger,
+                        PressThresholds(
+                            press=getattr(gestures, f"{finger}_press_threshold"),
+                            release=getattr(gestures, f"{finger}_release_threshold"),
+                            min_state_duration=gestures.min_state_duration,
+                        ),
                         baseline_time_constant=gestures.baseline_time_constant,
                         signal_time_constant=gestures.signal_time_constant,
-                    ),
-                    button,
-                )
+                    )
+                else:
+                    raise ValueError(
+                        f"Unknown gesture mode {gestures.mode!r}; "
+                        "expected 'transient' or 'level'"
+                    )
+                detectors[finger] = (detector, button)
             except ValueError as exc:
                 # An uncalibrated or inverted pair would otherwise click wildly.
                 log.error("%s -- %s clicking disabled", exc, finger)
-        for finger in detectors:
+        for finger, (detector, button) in detectors.items():
             log.info(
-                "Clicking: %s -> %s (metric=%s, press>%.2f release<%.2f)",
+                "Clicking: %s -> %s (%s mode, metric=%s, press>%.3f release<%.3f)",
                 finger,
-                detectors[finger][1].label,
+                button.label,
+                gestures.mode,
                 getattr(gestures, f"{finger}_metric"),
-                detectors[finger][0].thresholds.press,
-                detectors[finger][0].thresholds.release,
+                detector.thresholds.press,
+                detector.thresholds.release,
             )
         return detectors
 

@@ -126,6 +126,115 @@ class PressThresholds:
             )
 
 
+class RateTracker:
+    """Smoothed time derivative of a metric, in units per second.
+
+    On a rigid object a held press and a rest are geometrically the same --
+    the finger is in the same place either way, so no measurement of *level*
+    can tell them apart. All the information is in the movement between them.
+    Differentiating amplifies per-frame noise, so the value is smoothed before
+    differencing and the derivative is smoothed again after.
+    """
+
+    def __init__(self, signal_time_constant: float, rate_time_constant: float) -> None:
+        if signal_time_constant < 0 or rate_time_constant < 0:
+            raise ValueError("time constants must be >= 0")
+        self._signal_tc = signal_time_constant
+        self._rate_tc = rate_time_constant
+        self._smoothed: float | None = None
+        self._rate = 0.0
+
+    @property
+    def rate(self) -> float:
+        return self._rate
+
+    def update(self, value: float, dt: float) -> float:
+        if self._smoothed is None:
+            self._smoothed = value
+            return 0.0
+        if dt <= 0:
+            return self._rate
+
+        previous = self._smoothed
+        alpha = dt / (self._signal_tc + dt) if self._signal_tc > 0 else 1.0
+        self._smoothed += alpha * (value - self._smoothed)
+
+        instantaneous = (self._smoothed - previous) / dt
+        beta = dt / (self._rate_tc + dt) if self._rate_tc > 0 else 1.0
+        self._rate += beta * (instantaneous - self._rate)
+        return self._rate
+
+    def reset(self) -> None:
+        self._smoothed = None
+        self._rate = 0.0
+
+
+@dataclass
+class RateThresholds:
+    """Signed rate thresholds for transient press detection.
+
+    ``press`` is positive (finger moving in the pressing direction) and
+    ``release`` is negative (moving back). They are not a hysteresis pair on
+    one level -- they are two opposite-direction events.
+    """
+
+    press: float
+    release: float
+    min_state_duration: float = 0.08
+
+    def validate(self, name: str) -> None:
+        if self.press <= 0:
+            raise ValueError(f"{name}: press rate must be positive, got {self.press}")
+        if self.release >= 0:
+            raise ValueError(
+                f"{name}: release rate must be negative, got {self.release}"
+            )
+
+
+class TransientPressStateMachine:
+    """Latches on a movement in one direction, unlatches on the opposite one.
+
+    Unlike the level machine, the state persists with no ongoing evidence:
+    once a press transient is seen the button stays down until a release
+    transient arrives. That is the only workable model when the held state is
+    invisible, and it is why the tracking-loss release path matters even more
+    here -- nothing else will spontaneously clear it.
+    """
+
+    def __init__(self, thresholds: RateThresholds, name: str = "finger") -> None:
+        thresholds.validate(name)
+        self._thresholds = thresholds
+        self._state = PressState.UP
+        self._last_change = 0.0
+
+    @property
+    def state(self) -> PressState:
+        return self._state
+
+    def update(self, rate: float, now: float) -> PressEvent | None:
+        if now - self._last_change < self._thresholds.min_state_duration:
+            return None
+
+        if self._state is PressState.UP and rate > self._thresholds.press:
+            self._state = PressState.DOWN
+            self._last_change = now
+            return PressEvent.PRESSED
+
+        if self._state is PressState.DOWN and rate < self._thresholds.release:
+            self._state = PressState.UP
+            self._last_change = now
+            return PressEvent.RELEASED
+
+        return None
+
+    def force_release(self, now: float) -> PressEvent | None:
+        if self._state is PressState.UP:
+            return None
+        self._state = PressState.UP
+        self._last_change = now
+        return PressEvent.RELEASED
+
+
 class PressStateMachine:
     """Hysteresis + debounce over a scalar. No filtering, no baseline.
 
@@ -226,12 +335,6 @@ class PressDetector:
         )
         return self._machine.update(self._deviation, now)
 
-    def reset(self) -> None:
-        """Forget the baseline (call when tracking is lost and reacquired)."""
-        self._baseline.reset()
-        self._last_update = None
-        self._deviation = 0.0
-
     def force_release(self, now: float) -> PressEvent | None:
         """Drop to UP regardless of thresholds or debounce.
 
@@ -242,3 +345,64 @@ class PressDetector:
         if event is not None:
             log.debug("%s: forced release", self._name)
         return event
+
+    def reset(self) -> None:
+        """Forget the baseline (call when tracking is lost and reacquired)."""
+        self._baseline.reset()
+        self._last_update = None
+        self._deviation = 0.0
+
+
+class TransientPressDetector:
+    """Press detection from movement rate. Same interface as PressDetector."""
+
+    def __init__(
+        self,
+        name: str,
+        thresholds: RateThresholds,
+        signal_time_constant: float = 0.06,
+        rate_time_constant: float = 0.06,
+    ) -> None:
+        self._name = name
+        self._thresholds = thresholds
+        self._rate = RateTracker(signal_time_constant, rate_time_constant)
+        self._machine = TransientPressStateMachine(thresholds, name)
+        self._last_update: float | None = None
+        self._raw = 0.0
+
+    @property
+    def state(self) -> PressState:
+        return self._machine.state
+
+    @property
+    def metric(self) -> float:
+        """Current rate -- what the thresholds compare against."""
+        return self._rate.rate
+
+    @property
+    def raw_metric(self) -> float:
+        return self._raw
+
+    @property
+    def baseline(self) -> float | None:
+        return None
+
+    @property
+    def thresholds(self) -> RateThresholds:
+        return self._thresholds
+
+    def update(self, metric: float, now: float) -> PressEvent | None:
+        dt = 0.0 if self._last_update is None else max(now - self._last_update, 0.0)
+        self._last_update = now
+        self._raw = metric
+        return self._machine.update(self._rate.update(metric, dt), now)
+
+    def force_release(self, now: float) -> PressEvent | None:
+        event = self._machine.force_release(now)
+        if event is not None:
+            log.debug("%s: forced release", self._name)
+        return event
+
+    def reset(self) -> None:
+        self._rate.reset()
+        self._last_update = None

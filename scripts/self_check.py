@@ -454,6 +454,87 @@ try:
 except ValueError:
     check("zero (uncalibrated) thresholds rejected", True)
 
+print("\n[6a] transient (rate) press detection")
+from src.gestures.finger_state import (  # noqa: E402
+    RateThresholds,
+    RateTracker,
+    TransientPressDetector,
+)
+
+# On a rigid case a held press looks exactly like a rest, so the detector has
+# to latch on the movement. These checks pin that behaviour down.
+RATE_TH = RateThresholds(press=20.0, release=-20.0, min_state_duration=0.08)
+
+
+def tap_detector() -> TransientPressDetector:
+    return TransientPressDetector("index", RateThresholds(20.0, -20.0, 0.08), 0.03, 0.03)
+
+
+def feed(detector, values, t0=0.0, step=1 / 30):
+    """Feed a sequence, returning the events emitted."""
+    events, t = [], t0
+    for value in values:
+        t += step
+        event = detector.update(value, t)
+        if event is not None:
+            events.append((round(t, 3), event))
+    return events, t
+
+
+det = tap_detector()
+# Rest, then a downward move, then hold at the new level, then move back.
+still = [100.0] * 40
+down = [100.0 + 2.0 * i for i in range(1, 11)]      # fast move down
+hold = [120.0] * 60                                  # held: NO further movement
+up = [120.0 - 2.0 * i for i in range(1, 11)]         # fast move back
+events, t = feed(det, still + down + hold + up + still)
+kinds = [e for _, e in events]
+check(
+    "a down-move then up-move gives exactly one press and one release",
+    kinds == [PressEvent.PRESSED, PressEvent.RELEASED],
+    f"{kinds}",
+)
+
+# The crucial property: a HELD press emits nothing further and stays down,
+# even though the held value is indistinguishable from a rest level.
+det = tap_detector()
+feed(det, still + down)
+check("latched DOWN after the movement", det.state is PressState.DOWN)
+events, _ = feed(det, [120.0] * 300, t0=100.0)  # 10 seconds perfectly still
+check(
+    "a 10s hold with zero movement stays DOWN",
+    events == [] and det.state is PressState.DOWN,
+    f"{events}, state={det.state}",
+)
+
+# Slow drift must never trigger, however far it travels.
+det = tap_detector()
+drifting = [100.0 + 0.05 * i for i in range(600)]  # 1.5 units/s for 20s
+events, _ = feed(det, drifting)
+check(
+    "slow drift never triggers a transient",
+    events == [],
+    f"{len(events)} events over 20s of drift",
+)
+
+# Rejects nonsense thresholds rather than clicking wildly.
+for bad, why in (
+    (RateThresholds(0.0, -1.0), "zero press rate"),
+    (RateThresholds(1.0, 0.0), "zero release rate"),
+    (RateThresholds(-1.0, -2.0), "negative press rate"),
+):
+    try:
+        TransientPressDetector("x", bad)
+        check(f"rejects {why}", False, "no error")
+    except ValueError:
+        check(f"rejects {why}", True)
+
+det = tap_detector()
+feed(det, still + down)
+check("forced release works from a latched press",
+      det.force_release(999.0) is PressEvent.RELEASED)
+check("state is UP after forced release", det.state is PressState.UP)
+
 print("\n[6b] calibration replay recovers a press buried in drift")
 from scripts.calibrate_press import (  # noqa: E402
     MIN_DPRIME,

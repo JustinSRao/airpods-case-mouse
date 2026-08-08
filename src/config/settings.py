@@ -147,6 +147,30 @@ class GestureSettings:
 
     enabled: bool = False
 
+    # "transient" | "level".
+    #
+    # transient (default) triggers on the movement of a press and latches:
+    # a downward flick presses, an upward one releases. This is the only model
+    # that can work on a rigid object, where a finger *held* against the case
+    # sits in exactly the same place as one merely resting on it -- measured
+    # repeatedly, no level-based metric could tell those apart.
+    #
+    # level compares against a resting baseline. Kept for a springy or
+    # travelling button, where the held state really is distinguishable.
+    mode: str = "transient"
+
+    # Rate thresholds for transient mode, in metric units per second. Press is
+    # positive, release negative. Written by the calibrator.
+    index_press_rate: float = 0.0
+    index_release_rate: float = 0.0
+    middle_press_rate: float = 0.0
+    middle_release_rate: float = 0.0
+
+    # Smoothing for the derivative. Differentiating amplifies per-frame noise,
+    # so the value is smoothed before differencing and the rate again after.
+    rate_signal_time_constant: float = 0.06
+    rate_time_constant: float = 0.06
+
     # Which scalar drives each finger's state machine. Chosen per finger by
     # the calibrator, which measures every candidate and keeps whichever
     # actually separates rest from press -- the winner is not the same for
