@@ -29,7 +29,7 @@ import numpy as np
 
 from src.camera.camera_manager import CameraError, CameraManager
 from src.config.settings import USER_CONFIG_PATH, AppSettings
-from src.debug.hud import HudState, render
+from src.debug.hud import HudState, PressRow, render
 from src.hotkeys import (
     VK_ESCAPE,
     VK_F5,
@@ -42,7 +42,14 @@ from src.hotkeys import (
     MultiPressDetector,
 )
 from src.mouse.motion_mapper import MotionMapper, MotionResult
+from src.gestures.finger_state import (
+    PressDetector,
+    PressEvent,
+    PressState,
+    PressThresholds,
+)
 from src.mouse.mouse_controller import (
+    MouseButton,
     MouseController,
     enable_dpi_awareness,
     get_screen_size,
@@ -50,6 +57,8 @@ from src.mouse.mouse_controller import (
 from src.tracking.hand_features import (
     ANCHOR_STRATEGY_NAMES,
     compute_anchor,
+    finger_flexion,
+    fingertip_drop,
     hand_scale,
     palm_width,
 )
@@ -127,6 +136,39 @@ class AirPodsMouseApp:
 
         self._last_hand_time: float | None = None
         self._had_hand = False
+        self._press_detectors = self._build_press_detectors()
+
+    def _build_press_detectors(self) -> dict[str, tuple[PressDetector, MouseButton]]:
+        """One detector per finger, or none at all if not yet calibrated."""
+        gestures = self._settings.gestures
+        if not gestures.enabled:
+            log.warning(
+                "Finger clicking DISABLED (not calibrated). Run: "
+                ".\\.venv\\Scripts\\python.exe -m scripts.calibrate_press"
+            )
+            return {}
+
+        detectors: dict[str, tuple[PressDetector, MouseButton]] = {}
+        for finger, button in (
+            ("index", MouseButton.LEFT),
+            ("middle", MouseButton.RIGHT),
+        ):
+            thresholds = PressThresholds(
+                press=getattr(gestures, f"{finger}_press_threshold"),
+                release=getattr(gestures, f"{finger}_release_threshold"),
+                min_state_duration=gestures.min_state_duration,
+            )
+            try:
+                detectors[finger] = (PressDetector(finger, thresholds), button)
+            except ValueError as exc:
+                # An uncalibrated or inverted pair would otherwise click wildly.
+                log.error("%s -- %s clicking disabled", exc, finger)
+        log.info(
+            "Finger clicking enabled for: %s (metric=%s)",
+            ", ".join(detectors) or "nothing",
+            gestures.metric,
+        )
+        return detectors
 
     def _initial_anchor_index(self) -> int:
         try:
@@ -227,6 +269,8 @@ class AirPodsMouseApp:
 
                 if self._mouse_enabled and not motion.in_dead_zone:
                     self._mouse.move_relative(motion.dx, motion.dy)
+
+                self._update_presses(hand, time.perf_counter())
             else:
                 self._handle_tracking_loss()
 
@@ -247,6 +291,16 @@ class AirPodsMouseApp:
                     selection=settings.tracking.selection,
                     invert_x=settings.cursor.invert_x,
                     invert_y=settings.cursor.invert_y,
+                    press_rows=[
+                        PressRow(
+                            label=finger,
+                            state=detector.state,
+                            metric=detector.metric,
+                            press=detector.thresholds.press,
+                            release=detector.thresholds.release,
+                        )
+                        for finger, (detector, _) in self._press_detectors.items()
+                    ],
                 )
                 render(frame, state, draw_skeleton=settings.debug.draw_landmarks)
                 cv2.imshow(settings.debug.window_name, frame)
@@ -272,6 +326,8 @@ class AirPodsMouseApp:
             and self._time_since_hand() >= self._settings.tracking.tracking_loss_timeout
         ):
             log.warning("Tracking lost beyond timeout - releasing all mouse buttons")
+            self._release_all_presses(time.perf_counter())
+            # Belt and braces: catches anything held that no detector owns.
             self._mouse.release_all()
 
     def _handle_hotkeys(self) -> None:
@@ -326,9 +382,45 @@ class AirPodsMouseApp:
             self._mouse.reset_residual()
             self._set_status("filter reset")
 
+    def _press_metric(self, hand, finger: str) -> float:
+        metric = self._settings.gestures.metric
+        if metric == "flexion":
+            return finger_flexion(hand.world_landmarks, finger)
+        if metric == "drop":
+            return fingertip_drop(hand.world_landmarks, finger)
+        raise ValueError(
+            f"Unknown gesture metric {metric!r}; expected 'flexion' or 'drop'"
+        )
+
+    def _update_presses(self, hand, now: float) -> None:
+        """Feed each detector and translate its events into mouse buttons."""
+        for finger, (detector, button) in self._press_detectors.items():
+            event = detector.update(self._press_metric(hand, finger), now)
+            if event is None:
+                continue
+            # Detector state advances regardless, so that releasing a finger
+            # while control is off does not leave it stuck DOWN internally.
+            if not self._mouse_enabled:
+                continue
+            if event is PressEvent.PRESSED:
+                self._mouse.press(button)
+            else:
+                self._mouse.release(button)
+
+    def _release_all_presses(self, now: float) -> None:
+        """Force every finger UP and send the matching mouse-ups.
+
+        Used on tracking loss and when control is switched off, so a button
+        can never outlive the hand that pressed it.
+        """
+        for detector, button in self._press_detectors.values():
+            if detector.force_release(now) is PressEvent.RELEASED:
+                self._mouse.release(button)
+
     def _toggle_mouse_control(self) -> None:
         self._mouse_enabled = not self._mouse_enabled
         if not self._mouse_enabled:
+            self._release_all_presses(time.perf_counter())
             self._mouse.release_all()
             self._mouse.reset_residual()
         self._mapper.reset()

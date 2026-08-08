@@ -260,7 +260,127 @@ except ValueError:
 check("default selection is a known mode",
       AppSettings.load().tracking.selection in SELECTION_MODES)
 
-print("\n[6] multi-press toggle (P x5 within 5s)")
+print("\n[6] finger press state machine")
+from src.gestures.finger_state import (  # noqa: E402
+    PressDetector,
+    PressEvent,
+    PressState,
+    PressThresholds,
+)
+from src.tracking.hand_features import finger_flexion, fingertip_drop  # noqa: E402
+
+THRESHOLDS = PressThresholds(press=40.0, release=25.0, min_state_duration=0.05)
+
+
+def fresh() -> PressDetector:
+    return PressDetector("index", PressThresholds(40.0, 25.0, 0.05))
+
+
+det = fresh()
+t = 1.0
+check("starts UP", det.state is PressState.UP)
+check("below press threshold does nothing", det.update(10.0, t) is None)
+
+t += 0.1
+check("crossing press fires PRESSED", det.update(50.0, t) is PressEvent.PRESSED)
+t += 0.1
+check("staying pressed fires nothing", det.update(55.0, t) is None)
+check("state remains DOWN while held", det.state is PressState.DOWN)
+
+# Hysteresis: a value between the two thresholds must NOT release.
+t += 0.1
+check("value inside hysteresis band does not release", det.update(30.0, t) is None)
+check("still DOWN inside the band", det.state is PressState.DOWN)
+
+t += 0.1
+check("crossing release fires RELEASED", det.update(20.0, t) is PressEvent.RELEASED)
+t += 0.1
+check("staying up fires nothing", det.update(15.0, t) is None)
+
+# Chatter: oscillating across a single threshold must not machine-gun clicks
+# once debounce is accounted for.
+det = fresh()
+events = []
+t = 10.0
+for i in range(200):
+    t += 0.005  # 200 Hz, far faster than the 0.05s debounce
+    value = 41.0 if i % 2 == 0 else 39.0
+    event = det.update(value, t)
+    if event is not None:
+        events.append(event)
+check(
+    "oscillating on the press threshold is debounced",
+    len(events) <= 2,
+    f"{len(events)} events from 200 oscillating frames",
+)
+
+# Forced release, the tracking-loss path.
+det = fresh()
+det.update(50.0, 20.0)
+check("forced release from DOWN reports RELEASED",
+      det.force_release(20.1) is PressEvent.RELEASED)
+check("forced release leaves state UP", det.state is PressState.UP)
+check("forced release from UP reports nothing", det.force_release(20.2) is None)
+
+# A press/release pair must always balance, or a button leaks.
+det = fresh()
+t = 30.0
+balance = 0
+for value in (10, 50, 55, 52, 20, 12, 60, 58, 10, 45, 50):
+    t += 0.1
+    event = det.update(float(value), t)
+    if event is PressEvent.PRESSED:
+        balance += 1
+    elif event is PressEvent.RELEASED:
+        balance -= 1
+if det.force_release(t + 0.1) is PressEvent.RELEASED:
+    balance -= 1
+check("presses and releases balance to zero", balance == 0, f"balance={balance}")
+
+# Inverted thresholds must be rejected, not silently accepted.
+try:
+    PressDetector("bad", PressThresholds(press=10.0, release=20.0))
+    check("inverted thresholds rejected", False, "no error raised")
+except ValueError:
+    check("inverted thresholds rejected", True)
+try:
+    PressDetector("bad", PressThresholds(press=0.0, release=0.0))
+    check("zero (uncalibrated) thresholds rejected", False, "no error raised")
+except ValueError:
+    check("zero (uncalibrated) thresholds rejected", True)
+
+print("\n[7] press metrics from landmarks")
+# A straight finger has ~zero flexion; a curled one has much more.
+straight = np.zeros((21, 3), dtype=np.float32)
+straight[Landmark.WRIST] = (0.00, 0.00, 0.0)
+straight[Landmark.INDEX_MCP] = (0.00, 0.04, 0.0)
+straight[Landmark.PINKY_MCP] = (0.06, 0.04, 0.0)
+straight[Landmark.INDEX_PIP] = (0.00, 0.08, 0.0)
+straight[Landmark.INDEX_DIP] = (0.00, 0.11, 0.0)
+straight[Landmark.INDEX_TIP] = (0.00, 0.13, 0.0)
+check("straight finger has near-zero flexion",
+      finger_flexion(straight, "index") < 5.0,
+      f"{finger_flexion(straight, 'index'):.1f} deg")
+
+curled = straight.copy()
+curled[Landmark.INDEX_DIP] = (0.00, 0.10, -0.02)
+curled[Landmark.INDEX_TIP] = (0.00, 0.08, -0.03)
+check("curled finger has clearly more flexion",
+      finger_flexion(curled, "index") > 40.0,
+      f"{finger_flexion(curled, 'index'):.1f} deg")
+
+# Translation invariance is the whole point: sliding the case must not click.
+shifted = curled + np.array([0.13, -0.07, 0.05], dtype=np.float32)
+check(
+    "flexion is translation invariant (moving the case is not a click)",
+    abs(finger_flexion(curled, "index") - finger_flexion(shifted, "index")) < 1e-3,
+)
+check(
+    "fingertip drop is translation invariant",
+    abs(fingertip_drop(curled, "index") - fingertip_drop(shifted, "index")) < 1e-3,
+)
+
+print("\n[8] multi-press toggle (P x5 within 5s)")
 from src.hotkeys import MultiPressDetector  # noqa: E402
 from src.main import TOGGLE_PRESS_COUNT, TOGGLE_PRESS_WINDOW  # noqa: E402
 
@@ -297,7 +417,7 @@ check("progress reports partial count", det.progress == (2, 5), f"{det.progress}
 det.expire(10.0)
 check("expire decays stale progress", det.progress == (0, 5), f"{det.progress}")
 
-print("\n[7] mouse controller (send path stubbed)")
+print("\n[9] mouse controller (send path stubbed)")
 check("INPUT struct is the size Windows expects",
       ctypes.sizeof(mc._INPUT) in (28, 40),
       f"sizeof={ctypes.sizeof(mc._INPUT)}")

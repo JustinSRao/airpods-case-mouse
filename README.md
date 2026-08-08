@@ -9,8 +9,9 @@ your middle finger right-click — as real held button states, so dragging works
 
 No extra hardware. No markers. No cloud. Everything runs locally on the CPU.
 
-> **Status: Milestones 1 and 2 complete.** Hand tracking and relative cursor
-> movement work. Finger-press clicking (Milestones 3–4) is not implemented yet.
+> **Status: Milestones 1–4 implemented.** Hand tracking, relative cursor
+> movement, and index/middle finger clicking. Clicking is **disabled until you
+> run the calibrator**, which measures thresholds against your own hand.
 
 ---
 
@@ -165,6 +166,65 @@ This matters more than any config value.
 
 Good lighting on your hand helps a lot. Backlighting (a bright window behind
 the desk) is the most common cause of unstable tracking.
+
+---
+
+## Calibration (required for clicking)
+
+Clicking ships **disabled**. Press thresholds are meaningless until measured
+against a real hand — a guessed one produces stray clicks on whatever happens
+to be under the cursor.
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.calibrate_press
+```
+
+It never sends mouse input; it only records. For each finger it runs two
+phases:
+
+1. **REST** (5 s) — hand on the case, fingers relaxed. Your resting finger may
+   already be quite curled, which is exactly why "fingertip is low = click"
+   does not work.
+2. **PRESS** (8 s) — press and release repeatedly, the way you actually would.
+
+It then prints both distributions and places the thresholds in the gap between
+them:
+
+```
+  index REST : min=12.30  p05=13.10  median=15.80  p95=18.40  max=19.90
+  index PRESS: min=31.20  p05=33.60  median=41.70  p95=49.10  max=52.30
+  separation: rest p95 = 18.40 -> press p05 = 33.60
+  -> press > 26.76, release < 22.96 (gap 15.20)
+```
+
+If the two ranges **overlap**, it refuses to write a threshold and says so —
+that means the metric cannot separate your rest from your press, and no
+threshold would work. Try `--metric drop`, or improve lighting and hand
+position so tracking is steadier.
+
+Results are written to `config/config.json` (git-ignored) and clicking is
+enabled only if every requested finger separated cleanly.
+
+Useful flags: `--dry-run` (measure without writing), `--fingers index`,
+`--metric drop`, `--rest-seconds` / `--press-seconds`.
+
+### How a press is detected
+
+The metric is **finger flexion**: the total bend of the PIP and DIP joints, in
+degrees, computed from MediaPipe's 3D *world* landmarks rather than image
+pixels. That matters — world landmarks are metric with their origin at the
+hand's centre, so the value is unchanged when you slide the case around, and
+largely immune to the foreshortening this steep camera angle produces.
+
+That invariance is the whole trick. Sliding the case moves every landmark
+together and leaves joint angles untouched; bending a finger changes them.
+So *moving the mouse* and *clicking* are cleanly separable.
+
+On top of the metric sits a two-state machine with **hysteresis** (press and
+release thresholds differ, so noise in the gap cannot flip the state) and
+**debounce** (a minimum dwell time, which absorbs a single noisy frame). It
+emits `mouseDown` and `mouseUp` exactly once per transition, so click-and-hold
+and dragging work as with a real mouse.
 
 ### Direction conventions
 
@@ -390,9 +450,9 @@ fine control. Fractions carry over to the next frame instead.
 | --- | --- |
 | 1 — Camera + right-hand tracking + debug HUD | ✅ Done |
 | 2 — Relative palm-anchor cursor movement | ✅ Done |
-| 3 — Index finger → left button (press/hold/release) | Next |
-| 4 — Middle finger → right button | Planned |
-| 5 — Calibration workflow | Planned |
+| 3 — Index finger → left button (press/hold/release) | ✅ Done |
+| 4 — Middle finger → right button | ✅ Done |
+| 5 — Calibration workflow | ✅ Press calibration done; cursor calibration planned |
 | 6 — Landmark dataset recorder | Planned |
 | 7 — Personalised press classifier | Planned |
 | 8 — Cursor feel: One Euro, threaded capture, adaptive dead zone | Planned |
@@ -402,9 +462,13 @@ fine control. Fractions carry over to the next frame instead.
 
 ## Known limitations
 
-- **No clicking yet.** Milestones 3 and 4 are not built.
+- **Clicking is heuristic, not learned.** It uses one hand-relative geometric
+  feature with hysteresis. A personalised classifier (Milestone 7) should do
+  better, especially at rejecting false positives.
+- **Press thresholds are per-setup.** Change your posture or screen angle
+  enough and you may need to recalibrate.
 - **~28 FPS ceiling**, set by the webcam, not the code. Every frame of latency
-  is ~33 ms.
+  is ~33 ms, which also bounds how fast a press can be detected.
 - **Right hand only**, by design.
 - **Lighting sensitive.** Backlighting degrades landmark stability badly.
 - **Thresholds are placeholders.** The values in `gestures` were not measured

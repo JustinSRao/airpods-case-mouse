@@ -108,6 +108,92 @@ def compute_anchor(landmarks_px: np.ndarray, strategy: str) -> np.ndarray:
     return fn(landmarks_px)
 
 
+FINGER_JOINTS: dict[str, tuple[Landmark, Landmark, Landmark, Landmark]] = {
+    "index": (
+        Landmark.INDEX_MCP,
+        Landmark.INDEX_PIP,
+        Landmark.INDEX_DIP,
+        Landmark.INDEX_TIP,
+    ),
+    "middle": (
+        Landmark.MIDDLE_MCP,
+        Landmark.MIDDLE_PIP,
+        Landmark.MIDDLE_DIP,
+        Landmark.MIDDLE_TIP,
+    ),
+}
+
+
+def _joint_angle(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    """Interior angle at ``b`` in the chain a-b-c, in degrees.
+
+    180 degrees means perfectly straight.
+    """
+    ba = a - b
+    bc = c - b
+    norm = np.linalg.norm(ba) * np.linalg.norm(bc)
+    if norm < 1e-9:
+        return 180.0
+    cosine = float(np.dot(ba, bc) / norm)
+    return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
+
+
+def finger_flexion(world_landmarks: np.ndarray, finger: str) -> float:
+    """Total bend of a finger's PIP and DIP joints, in degrees.
+
+    0 means a perfectly straight finger; larger means more curled, so the
+    value rises as the finger presses down.
+
+    Computed from MediaPipe's *world* landmarks (metres, origin at the hand's
+    centre) rather than image pixels. That makes it invariant to where the
+    hand is, how far away it is, and -- critically for this camera angle --
+    largely invariant to foreshortening, which would wreck a 2D angle.
+    """
+    mcp, pip, dip, tip = FINGER_JOINTS[finger]
+    pip_angle = _joint_angle(
+        world_landmarks[mcp], world_landmarks[pip], world_landmarks[dip]
+    )
+    dip_angle = _joint_angle(
+        world_landmarks[pip], world_landmarks[dip], world_landmarks[tip]
+    )
+    return (180.0 - pip_angle) + (180.0 - dip_angle)
+
+
+def palm_normal(world_landmarks: np.ndarray) -> np.ndarray:
+    """Unit vector perpendicular to the plane of the palm."""
+    wrist = world_landmarks[Landmark.WRIST]
+    to_index = world_landmarks[Landmark.INDEX_MCP] - wrist
+    to_pinky = world_landmarks[Landmark.PINKY_MCP] - wrist
+    normal = np.cross(to_index, to_pinky)
+    length = np.linalg.norm(normal)
+    if length < 1e-9:
+        return np.array([0.0, 0.0, 1.0])
+    return normal / length
+
+
+def world_hand_span(world_landmarks: np.ndarray) -> float:
+    """Index-MCP to pinky-MCP distance in metres, as a scale reference."""
+    span = (
+        world_landmarks[Landmark.INDEX_MCP] - world_landmarks[Landmark.PINKY_MCP]
+    )
+    return max(float(np.linalg.norm(span)), 1e-4)
+
+
+def fingertip_drop(world_landmarks: np.ndarray, finger: str) -> float:
+    """Fingertip offset from the palm plane, in hand-span units.
+
+    Signed: the direction of the palm normal depends on handedness, so the
+    sign is reported as-is and interpreted from measured data rather than
+    assumed. Magnitude is what matters -- it grows as the fingertip moves out
+    of the palm plane, which is what a downward press does.
+    """
+    _, _, _, tip = FINGER_JOINTS[finger]
+    offset = world_landmarks[tip] - world_landmarks[Landmark.WRIST]
+    return float(np.dot(offset, palm_normal(world_landmarks))) / world_hand_span(
+        world_landmarks
+    )
+
+
 def fingertip_relative_to_palm(
     landmarks_px: np.ndarray, tip: Landmark
 ) -> np.ndarray:

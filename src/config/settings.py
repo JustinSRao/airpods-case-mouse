@@ -129,12 +129,34 @@ class CursorSettings:
 
 @dataclass
 class GestureSettings:
-    """Finger-press thresholds. Placeholders until Milestone 3/4."""
+    """Finger-press detection.
 
-    index_press_threshold: float = 0.62
-    index_release_threshold: float = 0.45
-    middle_press_threshold: float = 0.62
-    middle_release_threshold: float = 0.45
+    Disabled until calibrated, on purpose. Thresholds are meaningless before
+    they have been measured against a real hand, and a wrong threshold means
+    stray clicks on whatever is under the cursor. Run:
+
+        .\\.venv\\Scripts\\python.exe -m scripts.calibrate_press
+
+    which measures your resting and pressing values, writes thresholds into
+    config/config.json, and sets ``enabled`` to true.
+    """
+
+    enabled: bool = False
+
+    # Which scalar drives the state machine:
+    #   "flexion" - total PIP+DIP bend in degrees (rises as the finger curls)
+    #   "drop"    - fingertip distance from the palm plane, in hand spans
+    metric: str = "flexion"
+
+    # Units depend on ``metric``; both are written by the calibrator.
+    # press must exceed release -- the gap is the hysteresis band.
+    index_press_threshold: float = 0.0
+    index_release_threshold: float = 0.0
+    middle_press_threshold: float = 0.0
+    middle_release_threshold: float = 0.0
+
+    # Minimum seconds between state changes, to debounce a single noisy frame.
+    min_state_duration: float = 0.05
 
 
 @dataclass

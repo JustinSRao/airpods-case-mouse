@@ -36,10 +36,13 @@
     "max_velocity": 4000.0
   },
   "gestures": {
-    "index_press_threshold": 0.62,
-    "index_release_threshold": 0.45,
-    "middle_press_threshold": 0.62,
-    "middle_release_threshold": 0.45
+    "enabled": false,
+    "metric": "flexion",
+    "index_press_threshold": 0.0,
+    "index_release_threshold": 0.0,
+    "middle_press_threshold": 0.0,
+    "middle_release_threshold": 0.0,
+    "min_state_duration": 0.05
   },
   "debug": {
     "show_preview": true,

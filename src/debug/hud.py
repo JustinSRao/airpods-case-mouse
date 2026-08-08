@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 
+from src.gestures.finger_state import PressState
 from src.mouse.motion_mapper import MotionResult
 from src.tracking.hand_features import Landmark
 from src.tracking.hand_tracker import HAND_CONNECTIONS, HandObservation
@@ -29,6 +30,17 @@ _BONE = (200, 200, 200)
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 _LINE_HEIGHT = 18
 _PANEL_WIDTH = 250
+
+
+@dataclass
+class PressRow:
+    """One finger's live press state, for the metrics panel."""
+
+    label: str
+    state: PressState
+    metric: float
+    press: float
+    release: float
 
 
 @dataclass
@@ -50,6 +62,7 @@ class HudState:
     selection: str = "rightmost"
     invert_x: bool = False
     invert_y: bool = True
+    press_rows: list[PressRow] = field(default_factory=list)
 
 
 def draw_landmarks(frame: np.ndarray, hand: HandObservation) -> None:
@@ -135,8 +148,26 @@ def draw_panel(frame: np.ndarray, state: HudState) -> None:
         lines.append(("  [velocity clamped]", _AMBER))
 
     lines.append(("", _WHITE))
-    lines.append(("INDEX:  (milestone 3)", _GREY))
-    lines.append(("MIDDLE: (milestone 4)", _GREY))
+    if not state.press_rows:
+        lines.append(("CLICKS: not calibrated", _AMBER))
+        lines.append((" run scripts.calibrate_press", _GREY))
+    else:
+        for row in state.press_rows:
+            down = row.state is PressState.DOWN
+            lines.append(
+                (
+                    f"{row.label.upper():<7} {row.state.value}",
+                    _GREEN if down else _GREY,
+                )
+            )
+            # The live metric against its two thresholds is what makes a bad
+            # threshold visible instead of merely felt.
+            lines.append(
+                (
+                    f"  {row.metric:7.2f}  p>{row.press:.2f} r<{row.release:.2f}",
+                    _GREY,
+                )
+            )
 
     lines.append(("", _WHITE))
     lines.append(("ESC quit | PPPPP mouse", _GREY))
