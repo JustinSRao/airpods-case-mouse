@@ -526,9 +526,14 @@ check(
 # Every registered metric must be translation invariant, or sliding the case
 # would register as a click. This is the property the whole design rests on,
 # so it is asserted for all of them rather than the two written by hand.
+# The 2D metrics need pixel landmarks, so both representations are shifted.
+px_base = synthetic_hand()
+px_shift = synthetic_hand(offset=np.array([41.0, -23.0]))
+px_scaled = synthetic_hand(scale=1.7)
+
 for name in PRESS_METRIC_NAMES:
-    here = press_metric(curled, "index", name)
-    there = press_metric(shifted, "index", name)
+    here = press_metric(px_base, curled, "index", name)
+    there = press_metric(px_shift, shifted, "index", name)
     check(
         f"metric '{name}' is translation invariant",
         abs(here - there) < 1e-3,
@@ -538,20 +543,43 @@ for name in PRESS_METRIC_NAMES:
 # ...and scale invariant, so leaning closer to the camera is not a click.
 scaled = curled * 1.8
 for name in PRESS_METRIC_NAMES:
-    here = press_metric(curled, "index", name)
-    there = press_metric(scaled, "index", name)
+    here = press_metric(px_base, curled, "index", name)
+    there = press_metric(px_scaled, scaled, "index", name)
     check(
         f"metric '{name}' is scale invariant",
         abs(here - there) < 1e-2,
         f"{here:.4f} vs {there:.4f}",
     )
 
-check("all metrics report higher when curled",
-      press_metric(curled, "index", "total_flexion")
-      > press_metric(straight, "index", "total_flexion"))
+check("world metric reports higher when curled",
+      press_metric(px_base, curled, "index", "total_flexion")
+      > press_metric(px_base, straight, "index", "total_flexion"))
+
+# The 2D metrics must respond to the tip moving, in the "higher = pressed"
+# direction: tip closer to the palm, and tip lower than its knuckle.
+px_pressed = synthetic_hand()
+px_pressed[Landmark.INDEX_TIP] = px_pressed[Landmark.INDEX_MCP] + np.array([0.0, 12.0])
+for name in ("tip_palm_2d", "tip_mcp_2d", "tip_below_mcp_2d"):
+    check(
+        f"2D metric '{name}' rises when the tip presses down",
+        press_metric(px_pressed, curled, "index", name)
+        > press_metric(px_base, curled, "index", name),
+    )
+
+# Index and middle must be independent, or one finger's press clicks both.
+px_index_only = synthetic_hand()
+px_index_only[Landmark.INDEX_TIP] += np.array([0.0, 20.0])
+check(
+    "moving index does not change middle's 2D metric",
+    abs(
+        press_metric(px_index_only, curled, "middle", "tip_below_mcp_2d")
+        - press_metric(px_base, curled, "middle", "tip_below_mcp_2d")
+    )
+    < 1e-6,
+)
 
 try:
-    press_metric(curled, "index", "nonsense")
+    press_metric(px_base, curled, "index", "nonsense")
     check("unknown metric rejected", False, "no error")
 except ValueError:
     check("unknown metric rejected", True)

@@ -397,7 +397,9 @@ class AirPodsMouseApp:
 
     def _press_metric(self, hand, finger: str) -> float:
         metric = getattr(self._settings.gestures, f"{finger}_metric")
-        return press_metric(hand.world_landmarks, finger, metric)
+        return press_metric(
+            hand.landmarks_px, hand.world_landmarks, finger, metric
+        )
 
     def _update_presses(self, hand, now: float) -> None:
         """Feed each detector and translate its events into mouse buttons."""

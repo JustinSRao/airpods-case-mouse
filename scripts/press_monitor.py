@@ -17,7 +17,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
+import statistics
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -29,17 +32,39 @@ from src.tracking.hand_features import PRESS_METRIC_NAMES, press_metric
 from src.tracking.hand_tracker import HandTracker
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
-PANEL_WIDTH = 560
-ROW_HEIGHT = 30
+PANEL_WIDTH = 620
+ROW_HEIGHT = 24
 BAR_LEFT = 250
-BAR_WIDTH = 280
+BAR_WIDTH = 240
 
-# Decay the observed peak so an old spike does not permanently rescale the bar.
+# Decay the observed peak so an old spike does not permanently rescale things.
 PEAK_HALF_LIFE = 4.0
+
+# Frames of history used to estimate each metric's noise floor.
+NOISE_WINDOW = 150
+
+# Bars are drawn on a FIXED scale in noise units, not auto-scaled. That is the
+# whole point: jitter must look small and a real press must look big.
+Z_FULL_SCALE = 8.0
+# Deviation worth this many sigma is plausibly a real press rather than noise.
+Z_SIGNIFICANT = 3.0
 
 
 class MetricRow:
-    """Baseline, current deviation and a decaying peak for one metric."""
+    """Baseline, deviation, and the deviation expressed in noise units.
+
+    Showing raw deviation scaled to its own peak is useless here: a row that
+    is pure jitter fills the bar exactly like a row carrying real signal. What
+    matters is deviation *relative to that metric's own noise floor*, which is
+    also the only way to compare degrees against dimensionless ratios.
+
+    The noise floor is estimated from consecutive-frame differences. Landmark
+    jitter is frame-to-frame white noise while a press unfolds over many
+    frames, so differencing isolates the noise and a press barely contributes.
+    The median absolute difference is used (times 1.4826/sqrt(2), the robust
+    Gaussian sigma estimator) so that occasional large real movements do not
+    inflate the estimate.
+    """
 
     def __init__(self, finger: str, metric: str, time_constant: float) -> None:
         self.finger = finger
@@ -47,88 +72,103 @@ class MetricRow:
         self.tracker = BaselineTracker(time_constant)
         self.raw = 0.0
         self.deviation = 0.0
-        self.peak = 1e-6
+        self.peak_z = 0.0
+        self._previous: float | None = None
+        self._diffs: deque[float] = deque(maxlen=NOISE_WINDOW)
+
+    @property
+    def sigma(self) -> float:
+        if len(self._diffs) < 20:
+            return 0.0
+        return 1.4826 * statistics.median(self._diffs) / math.sqrt(2.0)
+
+    @property
+    def z(self) -> float:
+        sigma = self.sigma
+        return self.deviation / sigma if sigma > 1e-12 else 0.0
 
     def update(self, value: float, dt: float) -> None:
         self.raw = value
         self.deviation = self.tracker.update(value, dt, frozen=False)
+        if self._previous is not None:
+            self._diffs.append(abs(value - self._previous))
+        self._previous = value
         decay = 0.5 ** (dt / PEAK_HALF_LIFE)
-        self.peak = max(self.peak * decay, abs(self.deviation), 1e-6)
+        self.peak_z = max(self.peak_z * decay, abs(self.z))
 
     def reset(self) -> None:
         self.tracker.reset()
-        self.peak = 1e-6
+        self._diffs.clear()
+        self._previous = None
+        self.peak_z = 0.0
 
 
 def draw_panel(rows: list[MetricRow], height: int, tracked: bool) -> np.ndarray:
     panel = np.full((height, PANEL_WIDTH, 3), 22, dtype=np.uint8)
 
-    header = "PRESS METRICS - deviation from baseline" if tracked else "NO HAND DETECTED"
+    header = (
+        "DEVIATION IN NOISE UNITS (sigma)" if tracked else "NO HAND DETECTED"
+    )
     cv2.putText(
         panel,
         header,
-        (10, 22),
+        (10, 20),
         _FONT,
-        0.5,
+        0.48,
         (255, 255, 255) if tracked else (60, 60, 240),
         1,
         cv2.LINE_AA,
     )
     cv2.putText(
-        panel, "R reset   ESC quit", (10, 42), _FONT, 0.4, (150, 150, 150), 1, cv2.LINE_AA
+        panel,
+        f"bar = +/-{Z_FULL_SCALE:.0f} sigma   green past {Z_SIGNIFICANT:.0f}",
+        (10, 37),
+        _FONT,
+        0.38,
+        (150, 150, 150),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        panel, "R reset   ESC quit", (10, 52), _FONT, 0.38, (150, 150, 150), 1, cv2.LINE_AA
     )
 
-    # The row deviating most right now is almost certainly the useful metric.
-    best = max(rows, key=lambda r: abs(r.deviation) / r.peak if r.peak else 0.0)
-
-    y = 66
+    y = 72
     current_finger = ""
     for row in rows:
         if row.finger != current_finger:
             current_finger = row.finger
             cv2.putText(
-                panel, current_finger.upper(), (10, y), _FONT, 0.5,
+                panel, current_finger.upper(), (10, y + 10), _FONT, 0.46,
                 (0, 190, 255), 1, cv2.LINE_AA,
             )
-            y += 22
+            y += 20
 
-        highlight = row is best and abs(row.deviation) > 0.2 * row.peak
-        colour = (80, 220, 100) if highlight else (185, 185, 185)
+        z = row.z
+        significant = abs(z) >= Z_SIGNIFICANT
+        colour = (80, 220, 100) if significant else (150, 150, 150)
 
-        cv2.putText(
-            panel, row.metric, (22, y + 14), _FONT, 0.42, colour, 1, cv2.LINE_AA
-        )
-        cv2.putText(
-            panel,
-            f"{row.raw:8.2f}",
-            (135, y + 14),
-            _FONT,
-            0.42,
-            (140, 140, 140),
-            1,
-            cv2.LINE_AA,
-        )
+        cv2.putText(panel, row.metric, (22, y + 12), _FONT, 0.4, colour, 1, cv2.LINE_AA)
 
-        # Bar centred on zero, scaled to this metric's recent peak.
         centre = BAR_LEFT + BAR_WIDTH // 2
-        cv2.line(panel, (BAR_LEFT, y + 9), (BAR_LEFT + BAR_WIDTH, y + 9), (55, 55, 55), 1)
-        cv2.line(panel, (centre, y), (centre, y + 18), (90, 90, 90), 1)
-        extent = int((row.deviation / row.peak) * (BAR_WIDTH // 2)) if row.peak else 0
+        cv2.line(panel, (BAR_LEFT, y + 8), (BAR_LEFT + BAR_WIDTH, y + 8), (48, 48, 48), 1)
+        # Mark the significance threshold, so "is this real" is a visual check.
+        for sign in (-1, 1):
+            x = centre + int(sign * (Z_SIGNIFICANT / Z_FULL_SCALE) * (BAR_WIDTH // 2))
+            cv2.line(panel, (x, y + 1), (x, y + 15), (70, 70, 70), 1)
+        cv2.line(panel, (centre, y), (centre, y + 16), (100, 100, 100), 1)
+
+        extent = int((z / Z_FULL_SCALE) * (BAR_WIDTH // 2))
         extent = max(-BAR_WIDTH // 2, min(BAR_WIDTH // 2, extent))
         if extent:
-            cv2.rectangle(
-                panel,
-                (centre, y + 3),
-                (centre + extent, y + 15),
-                colour,
-                -1,
-            )
+            cv2.rectangle(panel, (centre, y + 3), (centre + extent, y + 13), colour, -1)
+
         cv2.putText(
             panel,
-            f"{row.deviation:+7.2f}  pk{row.peak:6.2f}",
-            (BAR_LEFT + BAR_WIDTH + 8, y + 14),
+            f"{z:+6.1f}s  pk{row.peak_z:5.1f}",
+            (BAR_LEFT + BAR_WIDTH + 8, y + 12),
             _FONT,
-            0.38,
+            0.37,
             colour,
             1,
             cv2.LINE_AA,
@@ -181,10 +221,16 @@ def main() -> int:
             if hand is not None:
                 for row in rows:
                     row.update(
-                        press_metric(hand.world_landmarks, row.finger, row.metric), dt
+                        press_metric(
+                            hand.landmarks_px,
+                            hand.world_landmarks,
+                            row.finger,
+                            row.metric,
+                        ),
+                        dt,
                     )
 
-            height = max(frame.shape[0], 66 + len(rows) * ROW_HEIGHT + len(fingers) * 22)
+            height = max(frame.shape[0], 82 + len(rows) * ROW_HEIGHT + len(fingers) * 20)
             if frame.shape[0] != height:
                 frame = cv2.copyMakeBorder(
                     frame, 0, height - frame.shape[0], 0, 0, cv2.BORDER_CONSTANT, value=(22, 22, 22)

@@ -108,7 +108,12 @@ def run_cycles(
                     recorded[name].append(
                         (
                             now,
-                            press_metric(hand.world_landmarks, finger, name),
+                            press_metric(
+                                hand.landmarks_px,
+                                hand.world_landmarks,
+                                finger,
+                                name,
+                            ),
                             pressing,
                         )
                     )

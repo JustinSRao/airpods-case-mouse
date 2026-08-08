@@ -234,22 +234,85 @@ def fingertip_drop(world_landmarks: np.ndarray, finger: str) -> float:
     )
 
 
-# Every candidate press metric, all defined so that a HIGHER value means
-# "more pressed". The calibrator measures all of them at once and picks
-# whichever actually separates rest from press on this hand -- there is no
-# reason to assume the same one wins for every finger or every camera angle.
-PRESS_METRICS: dict[str, "Callable[[np.ndarray, str], float]"] = {
-    "flexion": finger_flexion,
-    "mcp_flexion": finger_mcp_flexion,
-    "total_flexion": finger_total_flexion,
-    "curl_ratio": finger_curl_ratio,
-    "drop": fingertip_drop,
+# --- 2D metrics, from image landmarks ----------------------------------
+#
+# MediaPipe's world landmarks are a whole-hand 3D reconstruction, so noise in
+# the global fit moves every joint at once and one finger's angles respond to
+# another finger moving. The 2D image landmarks are closer to what the network
+# actually localises, so they are worth measuring alongside. Both are made
+# translation- and scale-invariant by working relative to the palm and
+# dividing by palm width.
+
+
+def tip_to_palm_2d(landmarks_px: np.ndarray, finger: str) -> float:
+    """How far the fingertip sits from the palm centre, in palm widths.
+
+    Negated so that curling -- which pulls the tip toward the palm -- raises
+    the value, matching the "higher means more pressed" convention.
+    """
+    _, _, _, tip = FINGER_JOINTS[finger]
+    offset = landmarks_px[tip] - palm_centroid(landmarks_px)
+    return -float(np.linalg.norm(offset)) / hand_scale(landmarks_px)
+
+
+def tip_to_mcp_2d(landmarks_px: np.ndarray, finger: str) -> float:
+    """Tip-to-knuckle distance, in palm widths. Shortens as the finger bends."""
+    mcp, _, _, tip = FINGER_JOINTS[finger]
+    offset = landmarks_px[tip] - landmarks_px[mcp]
+    return -float(np.linalg.norm(offset)) / hand_scale(landmarks_px)
+
+
+def tip_below_mcp_2d(landmarks_px: np.ndarray, finger: str) -> float:
+    """Fingertip height below its own knuckle, in palm widths.
+
+    Image y grows downward, so a fingertip pressing down raises this. Measured
+    against the knuckle rather than the frame, so sliding the case does not
+    change it.
+    """
+    mcp, _, _, tip = FINGER_JOINTS[finger]
+    return float(landmarks_px[tip][1] - landmarks_px[mcp][1]) / hand_scale(
+        landmarks_px
+    )
+
+
+# Every candidate press metric, all with the same signature and all defined so
+# that a HIGHER value means "more pressed". The calibrator measures all of them
+# at once and keeps whichever actually separates rest from press -- there is no
+# reason to assume the same one wins for every finger or camera angle.
+PressMetricFn = Callable[[np.ndarray, np.ndarray, str], float]
+
+
+def _from_world(fn: Callable[[np.ndarray, str], float]) -> PressMetricFn:
+    def wrapper(landmarks_px: np.ndarray, world: np.ndarray, finger: str) -> float:
+        return fn(world, finger)
+
+    return wrapper
+
+
+def _from_pixels(fn: Callable[[np.ndarray, str], float]) -> PressMetricFn:
+    def wrapper(landmarks_px: np.ndarray, world: np.ndarray, finger: str) -> float:
+        return fn(landmarks_px, finger)
+
+    return wrapper
+
+
+PRESS_METRICS: dict[str, PressMetricFn] = {
+    "flexion": _from_world(finger_flexion),
+    "mcp_flexion": _from_world(finger_mcp_flexion),
+    "total_flexion": _from_world(finger_total_flexion),
+    "curl_ratio": _from_world(finger_curl_ratio),
+    "drop": _from_world(fingertip_drop),
+    "tip_palm_2d": _from_pixels(tip_to_palm_2d),
+    "tip_mcp_2d": _from_pixels(tip_to_mcp_2d),
+    "tip_below_mcp_2d": _from_pixels(tip_below_mcp_2d),
 }
 
 PRESS_METRIC_NAMES = tuple(PRESS_METRICS)
 
 
-def press_metric(world_landmarks: np.ndarray, finger: str, metric: str) -> float:
+def press_metric(
+    landmarks_px: np.ndarray, world_landmarks: np.ndarray, finger: str, metric: str
+) -> float:
     """Evaluate one named press metric."""
     try:
         fn = PRESS_METRICS[metric]
@@ -257,7 +320,7 @@ def press_metric(world_landmarks: np.ndarray, finger: str, metric: str) -> float
         raise ValueError(
             f"Unknown press metric {metric!r}; expected one of {PRESS_METRIC_NAMES}"
         ) from None
-    return fn(world_landmarks, finger)
+    return fn(landmarks_px, world_landmarks, finger)
 
 
 def fingertip_relative_to_palm(
