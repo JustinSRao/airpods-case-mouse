@@ -547,6 +547,109 @@ def load_recording(path: Path) -> tuple[dict[str, tuple[dict[str, list], list]],
     return finger_data, payload.get("settings", {})
 
 
+def drop_settle(
+    samples: list[tuple[float, float, bool]],
+    cues: list[tuple[float, bool]],
+    settle: float,
+) -> list[tuple[float, float, bool]]:
+    """Remove frames within ``settle`` seconds after each cue.
+
+    Applied at analysis time rather than while recording, so one take stays
+    usable for both level and transient analysis -- transient mode needs
+    exactly the frames level mode has to throw away.
+    """
+    cue_times = sorted(c for c, _ in cues)
+    kept = []
+    for timestamp, value, pressing in samples:
+        previous = [c for c in cue_times if c <= timestamp]
+        if previous and (timestamp - previous[-1]) < settle:
+            continue
+        kept.append((timestamp, value, pressing))
+    return kept
+
+
+def analyse_level(
+    recorded: dict[str, list[tuple[float, float, bool]]],
+    cues: list[tuple[float, bool]],
+    finger: str,
+    args: argparse.Namespace,
+) -> tuple[str, float, float] | None:
+    """Rank metrics by how cleanly the held states separate."""
+    print(f"\n  {finger}: {len(cues)} cued phases, settle {args.settle}s")
+    print("  (deviation from baseline; thresholds chosen by simulating")
+    print("   the real state machine and counting false clicks)\n")
+    print(
+        f"    {'metric':<18}{'d-prime':>9}{'released~':>11}{'pressed~':>10}"
+        f"{'clean':>7}{'press>':>9}{'release<':>10}"
+    )
+
+    evaluated: list[tuple[MetricScore, ThresholdResult | None]] = []
+    for name in PRESS_METRIC_NAMES:
+        samples = drop_settle(recorded[name], cues, args.settle)
+        series = replay_deviations(
+            samples, args.baseline_time_constant, args.signal_time_constant
+        )
+        rest_dev, press_dev = split_by_label(series)
+        if len(rest_dev) < 20 or len(press_dev) < 20:
+            continue
+        score = MetricScore(name, rest_dev, press_dev)
+        result = (
+            best_thresholds(series, args.min_state_duration)
+            if score.dprime >= MIN_DPRIME
+            else None
+        )
+        evaluated.append((score, result))
+
+    if not evaluated:
+        print("    !! too few samples - was the hand tracked throughout?")
+        return None
+
+    evaluated.sort(
+        key=lambda pair: (pair[1] is not None, pair[0].dprime), reverse=True
+    )
+    for score, result in evaluated:
+        head = (
+            f"    {score.name:<18}{score.dprime:>9.2f}"
+            f"{score.rest_median:>11.3f}{score.press_median:>10.3f}"
+        )
+        if result is None:
+            print(f"{head}{'no':>7}{'-':>9}{'-':>10}")
+        else:
+            print(f"{head}{'YES':>7}{result.press:>9.3f}{result.release:>10.3f}")
+
+    if args.metric:
+        match = [p for p in evaluated if p[0].name == args.metric]
+        if not match or match[0][1] is None:
+            print(f"    !! forced metric {args.metric!r} has no clean threshold")
+            return None
+        score, result = match[0]
+    else:
+        score, result = evaluated[0]
+        if result is None:
+            print(f"    !! {finger}: no metric gives a clean threshold.")
+            return None
+
+    print(
+        f"\n    -> '{score.name}': press > {result.press:.3f}, "
+        f"release < {result.release:.3f}   "
+        f"({result.detected_presses}/{result.total_presses} presses caught, "
+        f"{result.false_clicks} false clicks, d'={score.dprime:.2f})"
+    )
+    return (score.name, result.press, result.release)
+
+
+def analyse(
+    recorded: dict[str, list[tuple[float, float, bool]]],
+    cues: list[tuple[float, bool]],
+    finger: str,
+    args: argparse.Namespace,
+) -> tuple[str, float, float] | None:
+    """Dispatch to the analysis matching the configured mode."""
+    if args.mode == "transient":
+        return analyse_transient(recorded, cues, finger, args)
+    return analyse_level(recorded, cues, finger, args)
+
+
 def analyse_transient(
     recorded: dict[str, list[tuple[float, float, bool]]],
     cues: list[tuple[float, bool]],
@@ -678,7 +781,7 @@ def main() -> int:
         for finger, (recorded, cues) in finger_data.items():
             if fingers and finger not in fingers:
                 continue
-            picked = analyse_transient(recorded, cues, finger, args)
+            picked = analyse(recorded, cues, finger, args)
             if picked is not None:
                 chosen[finger] = picked
         if args.dry_run or not chosen:
@@ -705,101 +808,15 @@ def main() -> int:
                     cycles=args.cycles,
                     rest_seconds=args.rest_seconds,
                     press_seconds=args.press_seconds,
-                    # Transient mode must keep the moment of movement.
-                    settle=0.0 if args.mode == "transient" else args.settle,
+                    # Always keep every frame; settling is applied at analysis
+                    # time so one take serves both modes.
+                    settle=0.0,
                 )
 
                 finger_data[finger] = (recorded, cues)
-
-                if args.mode == "transient":
-                    picked = analyse_transient(recorded, cues, finger, args)
-                    if picked is not None:
-                        chosen[finger] = picked
-                    continue
-
-                n_rest = sum(1 for s in recorded[PRESS_METRIC_NAMES[0]] if not s[2])
-                n_press = sum(1 for s in recorded[PRESS_METRIC_NAMES[0]] if s[2])
-                print(f"\n  {finger}: {n_rest} rest samples, {n_press} press samples")
-                print("  (deviation from baseline; thresholds chosen by simulating")
-                print("   the real state machine and counting false clicks)\n")
-                print(
-                    f"    {'metric':<17}{'d-prime':>8}{'clean':>7}"
-                    f"{'press>':>9}{'release<':>10}{'margin':>8}"
-                )
-
-                evaluated = []
-                for name in PRESS_METRIC_NAMES:
-                    series = replay_deviations(
-                        recorded[name],
-                        args.baseline_time_constant,
-                        args.signal_time_constant,
-                    )
-                    rest_dev, press_dev = split_by_label(series)
-                    if len(rest_dev) < 20 or len(press_dev) < 20:
-                        continue
-                    score = MetricScore(name, rest_dev, press_dev)
-                    # Gate on effect size before trusting the threshold search,
-                    # which can otherwise fit noise across a few segments.
-                    result = (
-                        best_thresholds(series, args.min_state_duration)
-                        if score.dprime >= MIN_DPRIME
-                        else None
-                    )
-                    evaluated.append((score, result))
-
-                if not evaluated:
-                    print("    !! too few samples - was the hand tracked throughout?")
-                    continue
-
-                # Rank by whether a clean threshold exists first, then by how
-                # much hysteresis margin it leaves, then by raw separation.
-                evaluated.sort(
-                    key=lambda pair: (
-                        pair[1] is not None,
-                        pair[1].margin if pair[1] else 0.0,
-                        pair[0].dprime,
-                    ),
-                    reverse=True,
-                )
-                for score, result in evaluated:
-                    if result is None:
-                        print(
-                            f"    {score.name:<17}{score.dprime:>8.2f}{'no':>7}"
-                            f"{'-':>9}{'-':>10}{'-':>8}"
-                        )
-                    else:
-                        print(
-                            f"    {score.name:<17}{score.dprime:>8.2f}{'YES':>7}"
-                            f"{result.press:>9.3f}{result.release:>10.3f}"
-                            f"{result.margin:>8.3f}"
-                        )
-
-                if args.metric:
-                    match = [p for p in evaluated if p[0].name == args.metric]
-                    if not match or match[0][1] is None:
-                        print(f"    !! forced metric {args.metric!r} has no clean threshold")
-                        continue
-                    picked_score, picked_result = match[0]
-                else:
-                    picked_score, picked_result = evaluated[0]
-                    if picked_result is None:
-                        print(
-                            f"    !! {finger}: no metric gives a clean threshold. "
-                            "See the note printed at the end."
-                        )
-                        continue
-
-                print(
-                    f"\n    -> '{picked_score.name}': press > {picked_result.press:.3f}, "
-                    f"release < {picked_result.release:.3f}   "
-                    f"({picked_result.detected_presses}/{picked_result.total_presses} "
-                    f"presses caught, {picked_result.false_clicks} false clicks)"
-                )
-                chosen[finger] = (
-                    picked_score.name,
-                    picked_result.press,
-                    picked_result.release,
-                )
+                picked = analyse(recorded, cues, finger, args)
+                if picked is not None:
+                    chosen[finger] = picked
     except KeyboardInterrupt:
         print("\nAborted.")
         return 1

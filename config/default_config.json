@@ -37,7 +37,7 @@
   },
   "gestures": {
     "enabled": false,
-    "mode": "transient",
+    "mode": "level",
     "index_metric": "total_flexion",
     "middle_metric": "total_flexion",
     "index_press_rate": 0.0,

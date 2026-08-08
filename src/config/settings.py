@@ -147,17 +147,19 @@ class GestureSettings:
 
     enabled: bool = False
 
-    # "transient" | "level".
+    # "level" | "transient".
     #
-    # transient (default) triggers on the movement of a press and latches:
-    # a downward flick presses, an upward one releases. This is the only model
-    # that can work on a rigid object, where a finger *held* against the case
-    # sits in exactly the same place as one merely resting on it -- measured
-    # repeatedly, no level-based metric could tell those apart.
+    # level (default) compares against a rolling baseline of the released
+    # position. This works because releasing means lifting the finger clear of
+    # the case, so pressed and released really are different geometry --
+    # measured d' of 3.4-3.7. An earlier protocol that compared "pressed" with
+    # "resting on the case" found nothing, because on a rigid lid those are
+    # the same pose; the difference is the lift, not the push.
     #
-    # level compares against a resting baseline. Kept for a springy or
-    # travelling button, where the held state really is distinguishable.
-    mode: str = "transient"
+    # transient triggers on the movement instead and latches. Kept for a
+    # gesture where the finger returns to the same place after pressing, which
+    # leaves nothing for a level test to see.
+    mode: str = "level"
 
     # Rate thresholds for transient mode, in metric units per second. Press is
     # positive, release negative. Written by the calibrator.
