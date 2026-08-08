@@ -5,6 +5,33 @@ description: Build measurement instrumentation for a finger gesture BEFORE writi
 
 # Instrument first, threshold second
 
+## Read this before touching press detection
+
+Hard-won on real data. Re-deriving any of it costs hours.
+
+1. **A rigid object cannot be pressed *into*.** A finger held against an
+   AirPods case sits exactly where a resting finger sits. The detectable event
+   is the **lift**, not the push. Preserve that in any protocol or interaction
+   change.
+2. **Never discard the transition.** An early calibration dropped 0.6 s after
+   each cue as "settling" — precisely when the gesture happened — and so
+   compared two identical resting states. Four rounds of analysis found
+   nothing, and d' *fell* as the analysis improved. Record every frame; apply
+   settling at analysis time.
+3. **Baseline-relative, never absolute.** Resting posture drifts more over a
+   few seconds than a press changes anything.
+4. **Judge by simulating the state machine**, not percentile overlap.
+   Hysteresis and debounce change the answer near the boundary: the overlap
+   rule scored 0/12 on data the real detector handled 12/12.
+5. **But always pair simulation with a minimum effect size.** Alone, the
+   threshold search declared success on ~25% of recordings containing *no
+   press at all*.
+6. **Save the recording.** `--analyse` re-runs offline. Never make the user
+   perform the gesture again just to try a parameter.
+7. **Check the instrument before believing it.** The first press monitor
+   auto-scaled each bar to its own peak, so pure noise looked exactly like
+   signal. Display deviations in units of the metric's own noise floor.
+
 The project rule: **do not guess press thresholds.** Every number in
 `config.gestures` must come from a recording of the user's actual hand doing
 the actual motion. A guessed threshold produces false-positive clicks, and a

@@ -161,7 +161,8 @@ This matters more than any config value.
    - the HUD reads `RIGHT HAND: TRACKING`,
    - the magenta anchor circle sits in the middle of your palm and stays put
      when you hold still,
-   - `palm width` reads roughly 60–110 px.
+   - `palm width` reads roughly 90–130 px at 720p (below ~70 means your hand
+     is too far from the camera and landmark noise will hurt clicking).
 5. Tap **P** five times and move the case.
 
 Good lighting on your hand helps a lot. Backlighting (a bright window behind
@@ -179,52 +180,82 @@ to be under the cursor.
 .\.venv\Scripts\python.exe -m scripts.calibrate_press
 ```
 
-It never sends mouse input; it only records. For each finger it runs two
-phases:
+It never sends mouse input; it only records. Per finger it runs four cycles,
+following an on-screen banner:
 
-1. **REST** (5 s) — hand on the case, fingers relaxed. Your resting finger may
-   already be quite curled, which is exactly why "fingertip is low = click"
-   does not work.
-2. **PRESS** (8 s) — press and release repeatedly, the way you actually would.
+1. **RELEASE** (2.5 s) — **lift the finger clear of the case.**
+2. **PRESS** (2.0 s) — press down and hold.
 
-It then prints both distributions and places the thresholds in the gap between
-them:
+> **The lift is what makes this work.** A pressed finger and a finger merely
+> *resting* on the case are the same pose — an AirPods case does not depress,
+> so there is nothing for a camera to see. Releasing by lifting makes the two
+> states genuinely different geometry. If you release by just easing off
+> pressure, calibration will correctly find nothing.
+
+It measures all eight candidate metrics on the same frames, then picks the best
+per finger by **simulating the real state machine** and counting false clicks:
 
 ```
-  index REST : min=12.30  p05=13.10  median=15.80  p95=18.40  max=19.90
-  index PRESS: min=31.20  p05=33.60  median=41.70  p95=49.10  max=52.30
-  separation: rest p95 = 18.40 -> press p05 = 33.60
-  -> press > 26.76, release < 22.96 (gap 15.20)
+    metric              d-prime  released~  pressed~  clean   press>  release<
+    drop                   3.66     -0.037     0.573    YES    0.627    -0.015
+    tip_below_mcp_2d       3.56     -0.025     0.222    YES    0.172    -0.028
+    mcp_flexion            1.34     -1.114     4.433     no        -         -
+
+    -> 'drop': press > 0.627, release < -0.015   (4/4 presses caught,
+       0 false clicks, d'=3.66)
 ```
 
-If the two ranges **overlap**, it refuses to write a threshold and says so —
-that means the metric cannot separate your rest from your press, and no
-threshold would work. Try `--metric drop`, or improve lighting and hand
-position so tracking is steadier.
+A metric is only accepted if it clears a minimum effect size **and** a
+simulated threshold catches every press with zero false clicks. Both gates
+matter: on recordings containing no press at all, the threshold search alone
+declared success about a quarter of the time.
 
-Results are written to `config/config.json` (git-ignored) and clicking is
-enabled only if every requested finger separated cleanly.
+Results go to `config/config.json` (git-ignored), and clicking is enabled only
+if every requested finger passed.
 
-Useful flags: `--dry-run` (measure without writing), `--fingers index`,
-`--metric drop`, `--rest-seconds` / `--press-seconds`.
+### Re-tuning without re-recording
+
+Every run saves its raw samples to `data/` (landmark-derived numbers only, no
+imagery). Analysis can then be re-run offline, with no camera and no repeat
+performance of the gesture:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.calibrate_press --analyse data\calibration_<stamp>.json
+```
+
+Useful when sweeping parameters, since no two live performances are identical.
+
+Other flags: `--dry-run`, `--fingers index`, `--metric drop`, `--cycles`,
+`--settle`, `--mode {level,transient}`.
 
 ### How a press is detected
 
-The metric is **finger flexion**: the total bend of the PIP and DIP joints, in
-degrees, computed from MediaPipe's 3D *world* landmarks rather than image
-pixels. That matters — world landmarks are metric with their origin at the
-hand's centre, so the value is unchanged when you slide the case around, and
-largely immune to the foreshortening this steep camera angle produces.
+Thresholds compare **deviation from a rolling baseline** of the released
+position, not the raw value. Resting posture drifts over seconds by more than a
+press changes anything, so an absolute threshold cannot survive; a baseline
+that follows slow drift and freezes while the button is held can.
 
-That invariance is the whole trick. Sliding the case moves every landmark
-together and leaves joint angles untouched; bending a finger changes them.
-So *moving the mouse* and *clicking* are cleanly separable.
+The default metric is `drop` — fingertip distance from the plane of the palm,
+from MediaPipe's 3D world landmarks. All eight metrics are translation- and
+scale-invariant, which is what stops *sliding the case* from registering as a
+click: moving the hand shifts every landmark together and leaves palm-relative
+geometry untouched. `scripts/self_check.py` asserts that for every metric.
 
-On top of the metric sits a two-state machine with **hysteresis** (press and
-release thresholds differ, so noise in the gap cannot flip the state) and
-**debounce** (a minimum dwell time, which absorbs a single noisy frame). It
-emits `mouseDown` and `mouseUp` exactly once per transition, so click-and-hold
-and dragging work as with a real mouse.
+On top sits a two-state machine with **hysteresis** (press and release
+thresholds differ, so noise between them cannot flip the state) and
+**debounce** (a minimum dwell time, absorbing a single bad frame). It emits
+`mouseDown` and `mouseUp` exactly once per transition, so click-and-hold and
+dragging behave like a real mouse.
+
+### Live diagnostics
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.press_monitor
+```
+
+Shows every metric's deviation **in units of its own noise floor**, on a fixed
+scale with the 3σ line marked. Rows turn green past it. Use this to answer
+"does pressing move anything at all" in seconds, before touching thresholds.
 
 ### Direction conventions
 
@@ -273,8 +304,13 @@ git-ignored, so machine-specific tuning never gets committed.
 <details>
 <summary>Full configuration reference</summary>
 
-**`camera`** — `index` (0), `width` (640), `height` (480), `target_fps` (30),
+**`camera`** — `index` (0), `width` (1280), `height` (720), `target_fps` (30),
 `backend` (`dshow`), `flip_horizontal` (true).
+
+720p rather than 480p is deliberate: measured at the same 28.5 FPS (the webcam
+is the ceiling, not the pipeline) but palm width goes from ~64 px to ~107 px.
+Press detection is limited by landmark noise, and more pixels across the hand
+is the most direct lever on it.
 
 `backend` defaults to DirectShow because the Media Foundation backend threw a
 `cv::Mat` step assertion at 1280×720 on the development machine. DirectShow was
@@ -309,17 +345,17 @@ parameters.
 .\.venv\Scripts\python.exe -m scripts.bench --seconds 10
 ```
 
-Measured on the development laptop at 640×480:
+Measured on the development laptop at 1280×720, two hands:
 
 | Stage | Mean | p95 |
 | --- | --- | --- |
-| Capture | 19.0 ms | 33.3 ms |
-| Inference | 14.2 ms | 22.5 ms |
-| Full frame | 33.2 ms | 46.3 ms |
+| Capture | 9.3 ms | 23.6 ms |
+| Inference | 24.0 ms | 27.5 ms |
+| Full frame | 33.2 ms | 46.1 ms |
 
-**≈28 FPS**, against a camera that caps at 30. Capture and inference are
-currently serialised, so a capture thread would recover the last couple of
-frames — but not more, because the sensor itself is the ceiling. That is a
+**≈28 FPS**, against a camera that caps at 30 — identical to 480p, because the
+sensor is the ceiling, not the pipeline. Capture and inference are serialised,
+so a capture thread would recover the last frame or two and no more. That is a
 Milestone 8 concern, not a reason to add threads now.
 
 ---
@@ -402,16 +438,21 @@ airpods-case-mouse/
 │   ├── default_config.json    committed defaults
 │   └── config.json            your overrides (git-ignored)
 ├── models/                    hand_landmarker.task (git-ignored)
+├── data/                      saved calibration recordings (git-ignored)
 ├── scripts/
 │   ├── download_model.ps1
-│   ├── self_check.py          offline correctness checks
-│   └── bench.py               headless performance profile
+│   ├── self_check.py          offline correctness checks (~100 assertions)
+│   ├── bench.py               headless performance profile
+│   ├── calibrate_press.py     measure + choose press thresholds
+│   └── press_monitor.py       live metric-vs-noise diagnostics
 └── src/
     ├── main.py                capture loop, hotkeys, safety
     ├── camera/camera_manager.py
     ├── tracking/
-    │   ├── hand_tracker.py    MediaPipe Tasks wrapper
-    │   └── hand_features.py   anchors, palm width, relative geometry
+    │   ├── hand_tracker.py    MediaPipe Tasks wrapper, hand selection
+    │   └── hand_features.py   anchors, palm width, the 8 press metrics
+    ├── gestures/
+    │   └── finger_state.py    baselines, rate tracking, press state machines
     ├── mouse/
     │   ├── mouse_controller.py  SendInput via ctypes
     │   ├── cursor_filter.py     EMA / One Euro / none
@@ -462,11 +503,19 @@ fine control. Fractions carry over to the next frame instead.
 
 ## Known limitations
 
-- **Clicking is heuristic, not learned.** It uses one hand-relative geometric
-  feature with hysteresis. A personalised classifier (Milestone 7) should do
-  better, especially at rejecting false positives.
+- **You must release by lifting the finger clear of the case.** Easing off
+  pressure is not detectable — a rigid lid does not move, so a pressed finger
+  and a resting one are the same pose. This is a property of the hardware, not
+  the code.
+- **Resting your finger back down may read as pressed.** The released state is
+  "lifted", so a light rest sits in between. Recalibrate with a more distinct
+  lift if it feels trigger-happy.
+- **Clicking is heuristic, not learned.** One geometric feature with
+  hysteresis. A personalised classifier (Milestone 7) should do better,
+  especially at rejecting false positives.
 - **Press thresholds are per-setup.** Change your posture or screen angle
-  enough and you may need to recalibrate.
+  enough and you will need to recalibrate. Measured d' is ~2.9–3.7, which is
+  workable but not a huge margin.
 - **~28 FPS ceiling**, set by the webcam, not the code. Every frame of latency
   is ~33 ms, which also bounds how fast a press can be detected.
 - **Right hand only**, by design.
