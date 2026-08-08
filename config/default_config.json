@@ -1,8 +1,8 @@
 {
   "camera": {
     "index": 0,
-    "width": 640,
-    "height": 480,
+    "width": 1280,
+    "height": 720,
     "target_fps": 30,
     "backend": "dshow",
     "flip_horizontal": true
@@ -44,7 +44,8 @@
     "middle_press_threshold": 0.0,
     "middle_release_threshold": 0.0,
     "min_state_duration": 0.05,
-    "baseline_time_constant": 1.0
+    "baseline_time_constant": 1.0,
+    "signal_time_constant": 0.12
   },
   "debug": {
     "show_preview": true,

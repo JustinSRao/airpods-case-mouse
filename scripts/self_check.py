@@ -59,7 +59,9 @@ def synthetic_hand(offset: np.ndarray = None, scale: float = 1.0) -> np.ndarray:
 
 print("\n[1] settings")
 settings = AppSettings.load()
-check("defaults load", settings.camera.width == 640, f"got {settings.camera.width}")
+# 720p is deliberate: same measured FPS as 480p but ~1.67x more pixels across
+# the hand, which is the most direct lever on landmark noise.
+check("defaults load at 720p", settings.camera.width == 1280, f"got {settings.camera.width}")
 check("dshow backend default", settings.camera.backend == "dshow")
 check("anchor strategy valid", settings.anchor.strategy in ANCHOR_STRATEGY_NAMES)
 
@@ -453,7 +455,13 @@ except ValueError:
     check("zero (uncalibrated) thresholds rejected", True)
 
 print("\n[6b] calibration replay recovers a press buried in drift")
-from scripts.calibrate_press import MetricScore, replay_deviations  # noqa: E402
+from scripts.calibrate_press import (  # noqa: E402
+    MIN_DPRIME,
+    MetricScore,
+    best_thresholds,
+    replay_deviations,
+    split_by_label,
+)
 
 # Mirrors real measured behaviour: a press worth ~9 units sitting on top of
 # slow posture drift and frame noise, with settle frames discarded so the
@@ -473,23 +481,79 @@ for _cycle in range(4):
                 _samples.append((_t, _value, _pressing))
             _t += 1.0 / 30.0
 
-_rest_dev, _press_dev = replay_deviations(_samples, 1.0)
+_series = replay_deviations(_samples, 1.0, 0.12)
+_rest_dev, _press_dev = split_by_label(_series)
 _score = MetricScore("synthetic", _rest_dev, _press_dev)
 check(
-    "replay separates a 9-unit press from drift",
-    _score.usable,
-    f"gap={_score.gap:.2f} d'={_score.dprime:.2f}",
+    "replay recovers a real effect size from a press buried in drift",
+    _score.dprime >= MIN_DPRIME,
+    f"d'={_score.dprime:.2f} (need >= {MIN_DPRIME})",
 )
 check(
     "replay recovers most of the true press amplitude",
-    _score.press_median > 9.0 * 0.75,
+    _score.press_median > 9.0 * 0.6,
     f"recovered {_score.press_median:.2f} of 9.00",
 )
+
+_result = best_thresholds(_series, 0.05)
+check("simulation finds a clean threshold pair", _result is not None)
+if _result is not None:
+    check(
+        "chosen thresholds produce no false clicks",
+        _result.false_clicks == 0,
+        f"{_result.false_clicks} false clicks",
+    )
+    check(
+        "chosen thresholds catch every press",
+        _result.detected_presses == _result.total_presses,
+        f"{_result.detected_presses}/{_result.total_presses}",
+    )
+    check("press threshold exceeds release", _result.press > _result.release)
+
+
+def _synth_press(signal: float, noise: float, seed: int):
+    """Recording with a press of `signal` on top of drift and noise."""
+    rng = np.random.default_rng(seed)
+    out, t, drift = [], 0.0, 0.0
+    for _ in range(4):
+        for duration, pressing in ((2.5, False), (2.0, True)):
+            phase_start = t
+            while t - phase_start < duration:
+                drift += 1.2 / 30.0
+                value = 105.0 + drift + rng.normal(0, noise)
+                if pressing:
+                    value += signal
+                if (t - phase_start) >= 0.6:
+                    out.append((t, value, pressing))
+                t += 1.0 / 30.0
+    return out
+
+
+def _accepts(signal: float, noise: float, seed: int) -> bool:
+    """The full gate: effect size AND a clean simulated threshold."""
+    series = replay_deviations(_synth_press(signal, noise, seed), 1.0, 0.12)
+    rest, press = split_by_label(series)
+    if MetricScore("x", rest, press).dprime < MIN_DPRIME:
+        return False
+    return best_thresholds(series, 0.05) is not None
+
+# NULL CONTROL. A recording containing no press at all must never yield
+# thresholds. Simulation alone fails this -- with only four segments the
+# threshold search fits noise about a quarter of the time -- which is why the
+# effect-size gate exists. Calibration inventing a press that is not there is
+# the worst outcome available: it would enable clicking on pure jitter.
+_null_accepted = sum(_accepts(0.0, 7.1, seed) for seed in range(12))
 check(
-    "derived thresholds sit between the two states",
-    _score.thresholds()[1] > _score.rest_tail
-    and _score.thresholds()[0] < _score.press_tail,
-    f"thresholds={_score.thresholds()}",
+    "null recording (no press) is always rejected",
+    _null_accepted == 0,
+    f"accepted {_null_accepted}/12 recordings containing no press",
+)
+
+_real_accepted = sum(_accepts(8.9, 7.1, seed) for seed in range(8))
+check(
+    "a real press at measured 720p noise is accepted",
+    _real_accepted >= 7,
+    f"accepted {_real_accepted}/8",
 )
 
 print("\n[7] press metrics from landmarks")

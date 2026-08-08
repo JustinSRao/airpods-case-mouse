@@ -36,8 +36,12 @@ class CameraSettings:
     """
 
     index: int = 0
-    width: int = 640
-    height: int = 480
+    # 720p rather than 480p. Measured: identical 28.5 FPS (the webcam, not the
+    # code, is the ceiling) but palm width goes from ~64 px to ~107 px. Press
+    # detection is limited by landmark noise, and more pixels across the hand
+    # is the most direct way to reduce it.
+    width: int = 1280
+    height: int = 720
     target_fps: int = 30
     backend: str = "dshow"  # "dshow" | "msmf" | "any"
     # Webcams show a non-mirrored view. Flipping gives the natural "selfie"
@@ -166,6 +170,12 @@ class GestureSettings:
     # Shorter = adapts to posture faster but starts ignoring slow presses;
     # longer = holds a press better but reacts to posture changes sluggishly.
     baseline_time_constant: float = 1.0
+
+    # Fast smoothing applied to the metric before comparing against the
+    # baseline, in seconds. Landmark jitter is per-frame white noise while a
+    # press lasts ~1s, so averaging a handful of frames cuts the noise without
+    # blunting the press. Must stay well below baseline_time_constant.
+    signal_time_constant: float = 0.12
 
 
 @dataclass

@@ -163,6 +163,7 @@ class AirPodsMouseApp:
                         finger,
                         thresholds,
                         baseline_time_constant=gestures.baseline_time_constant,
+                        signal_time_constant=gestures.signal_time_constant,
                     ),
                     button,
                 )

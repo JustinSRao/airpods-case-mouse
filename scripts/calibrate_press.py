@@ -25,12 +25,19 @@ import json
 import logging
 import statistics
 import time
+from dataclasses import dataclass
 
 import cv2
 
 from src.camera.camera_manager import CameraManager
 from src.config.settings import USER_CONFIG_PATH, AppSettings
-from src.gestures.finger_state import BaselineTracker
+from src.gestures.finger_state import (
+    BaselineTracker,
+    PressEvent,
+    PressState,
+    PressStateMachine,
+    PressThresholds,
+)
 from src.tracking.hand_features import PRESS_METRIC_NAMES, press_metric
 from src.tracking.hand_tracker import HandTracker
 
@@ -50,6 +57,14 @@ PRESS_TAIL = 0.05
 # Cap on the timestep used when replaying the baseline, so gaps left by
 # discarded settle frames cannot advance it in one large jump.
 MAX_REPLAY_DT = 1.0 / 25.0
+
+# Minimum effect size before a metric is allowed to win, on top of simulating
+# cleanly. With only a handful of press segments, a threshold search can fit
+# noise: on recordings containing no press at all, simulation alone declared a
+# clean threshold in roughly a quarter of trials. Those recordings have d'
+# near zero, so requiring real separation as well removes them while leaving
+# genuine signal (measured d' ~3 at 720p) untouched.
+MIN_DPRIME = 1.5
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
@@ -174,7 +189,9 @@ def countdown(camera: CameraManager, message: str, seconds: float = 3.0) -> None
 
 
 def replay_deviations(
-    samples: list[tuple[float, float, bool]], time_constant: float
+    samples: list[tuple[float, float, bool]],
+    time_constant: float,
+    signal_time_constant: float = 0.0,
 ) -> tuple[list[float], list[float]]:
     """Re-run the runtime baseline algorithm over recorded samples.
 
@@ -183,9 +200,8 @@ def replay_deviations(
     derived from exactly the quantity the detector will compare at runtime
     rather than from raw values it never sees.
     """
-    tracker = BaselineTracker(time_constant)
-    rest_dev: list[float] = []
-    press_dev: list[float] = []
+    tracker = BaselineTracker(time_constant, signal_time_constant)
+    series: list[tuple[float, float, bool]] = []
     previous_time: float | None = None
 
     for timestamp, value, pressing in samples:
@@ -200,10 +216,131 @@ def replay_deviations(
         # Freeze on THIS sample's label. Using the previous one let the
         # baseline take one un-frozen step toward the already-pressed value.
         deviation = tracker.update(value, dt, frozen=pressing)
+        series.append((timestamp, deviation, pressing))
 
-        (press_dev if pressing else rest_dev).append(deviation)
+    return series
 
-    return rest_dev, press_dev
+
+def split_by_label(
+    series: list[tuple[float, float, bool]]
+) -> tuple[list[float], list[float]]:
+    rest = [d for _, d, pressing in series if not pressing]
+    press = [d for _, d, pressing in series if pressing]
+    return rest, press
+
+
+def segments(series: list[tuple[float, float, bool]]) -> list[tuple[int, int, bool]]:
+    """Contiguous runs of the same label, as (start, end, pressing)."""
+    runs: list[tuple[int, int, bool]] = []
+    start = 0
+    for i in range(1, len(series) + 1):
+        if i == len(series) or series[i][2] != series[start][2]:
+            runs.append((start, i, series[start][2]))
+            start = i
+    return runs
+
+
+@dataclass
+class ThresholdResult:
+    """What a candidate threshold pair actually does to the recording."""
+
+    press: float
+    release: float
+    false_clicks: int
+    detected_presses: int
+    total_presses: int
+    missed_releases: int
+
+    @property
+    def clean(self) -> bool:
+        """No stray clicks, every press caught, every one let go again."""
+        return (
+            self.false_clicks == 0
+            and self.detected_presses == self.total_presses
+            and self.missed_releases == 0
+        )
+
+    @property
+    def margin(self) -> float:
+        return self.press - self.release
+
+
+def simulate(
+    series: list[tuple[float, float, bool]],
+    press_threshold: float,
+    release_threshold: float,
+    min_state_duration: float,
+) -> ThresholdResult:
+    """Run the real state machine over the recording and count what happens.
+
+    This is the objective that matters. Percentile overlap is a proxy; a
+    false click is the actual cost, and hysteresis plus debounce change the
+    answer enough that the proxy is misleading near the boundary.
+    """
+    machine = PressStateMachine(
+        PressThresholds(press_threshold, release_threshold, min_state_duration)
+    )
+    runs = segments(series)
+    detected = set()
+    false_clicks = 0
+    missed_releases = 0
+
+    for run_index, (start, end, pressing) in enumerate(runs):
+        for i in range(start, end):
+            timestamp, deviation, _ = series[i]
+            event = machine.update(deviation, timestamp)
+            if event is PressEvent.PRESSED:
+                if pressing:
+                    detected.add(run_index)
+                else:
+                    false_clicks += 1
+        # By the end of a rest run the button must be back up, or a press
+        # leaked past its release and would still be held in real use.
+        if not pressing and machine.state is PressState.DOWN:
+            missed_releases += 1
+
+    total_presses = sum(1 for _, _, pressing in runs if pressing)
+    return ThresholdResult(
+        press=press_threshold,
+        release=release_threshold,
+        false_clicks=false_clicks,
+        detected_presses=len(detected),
+        total_presses=total_presses,
+        missed_releases=missed_releases,
+    )
+
+
+def best_thresholds(
+    series: list[tuple[float, float, bool]], min_state_duration: float
+) -> ThresholdResult | None:
+    """Search threshold pairs for one that clicks exactly when it should.
+
+    Among clean candidates, prefer the widest hysteresis margin: that is the
+    one with most room before noise starts producing stray clicks.
+    """
+    rest, press = split_by_label(series)
+    if len(rest) < 20 or len(press) < 20:
+        return None
+
+    low = min(rest)
+    high = max(press)
+    if not high > low:
+        return None
+
+    candidates = [low + (high - low) * f / 40.0 for f in range(1, 40)]
+    best: ThresholdResult | None = None
+    for press_threshold in candidates:
+        for release_threshold in candidates:
+            if release_threshold >= press_threshold:
+                continue
+            result = simulate(
+                series, press_threshold, release_threshold, min_state_duration
+            )
+            if not result.clean:
+                continue
+            if best is None or result.margin > best.margin:
+                best = result
+    return best
 
 
 class MetricScore:
@@ -264,6 +401,8 @@ def main() -> int:
         help="Seconds discarded after each phase change (reaction time).",
     )
     parser.add_argument("--baseline-time-constant", type=float, default=None)
+    parser.add_argument("--signal-time-constant", type=float, default=None)
+    parser.add_argument("--min-state-duration", type=float, default=None)
     parser.add_argument("--fingers", default="index,middle")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
@@ -279,6 +418,10 @@ def main() -> int:
     fingers = [f.strip() for f in args.fingers.split(",") if f.strip()]
     if args.baseline_time_constant is None:
         args.baseline_time_constant = settings.gestures.baseline_time_constant
+    if args.signal_time_constant is None:
+        args.signal_time_constant = settings.gestures.signal_time_constant
+    if args.min_state_duration is None:
+        args.min_state_duration = settings.gestures.min_state_duration
 
     print(f"\nCalibrating: {', '.join(fingers)}")
     print(f"{args.cycles} relax/press cycles per finger. Follow the banner.")
@@ -309,46 +452,89 @@ def main() -> int:
                     settle=args.settle,
                 )
 
-                scores = []
-                for name in PRESS_METRIC_NAMES:
-                    rest_dev, press_dev = replay_deviations(
-                        recorded[name], args.baseline_time_constant
-                    )
-                    if len(rest_dev) >= 20 and len(press_dev) >= 20:
-                        scores.append(MetricScore(name, rest_dev, press_dev))
-
                 n_rest = sum(1 for s in recorded[PRESS_METRIC_NAMES[0]] if not s[2])
                 n_press = sum(1 for s in recorded[PRESS_METRIC_NAMES[0]] if s[2])
                 print(f"\n  {finger}: {n_rest} rest samples, {n_press} press samples")
-                print("  (thresholds are deviation from the rolling baseline)")
-                if not scores:
+                print("  (deviation from baseline; thresholds chosen by simulating")
+                print("   the real state machine and counting false clicks)\n")
+                print(
+                    f"    {'metric':<17}{'d-prime':>8}{'clean':>7}"
+                    f"{'press>':>9}{'release<':>10}{'margin':>8}"
+                )
+
+                evaluated = []
+                for name in PRESS_METRIC_NAMES:
+                    series = replay_deviations(
+                        recorded[name],
+                        args.baseline_time_constant,
+                        args.signal_time_constant,
+                    )
+                    rest_dev, press_dev = split_by_label(series)
+                    if len(rest_dev) < 20 or len(press_dev) < 20:
+                        continue
+                    score = MetricScore(name, rest_dev, press_dev)
+                    # Gate on effect size before trusting the threshold search,
+                    # which can otherwise fit noise across a few segments.
+                    result = (
+                        best_thresholds(series, args.min_state_duration)
+                        if score.dprime >= MIN_DPRIME
+                        else None
+                    )
+                    evaluated.append((score, result))
+
+                if not evaluated:
                     print("    !! too few samples - was the hand tracked throughout?")
                     continue
-                scores.sort(key=lambda s: s.normalised_gap, reverse=True)
-                for score in scores:
-                    print(score.row())
+
+                # Rank by whether a clean threshold exists first, then by how
+                # much hysteresis margin it leaves, then by raw separation.
+                evaluated.sort(
+                    key=lambda pair: (
+                        pair[1] is not None,
+                        pair[1].margin if pair[1] else 0.0,
+                        pair[0].dprime,
+                    ),
+                    reverse=True,
+                )
+                for score, result in evaluated:
+                    if result is None:
+                        print(
+                            f"    {score.name:<17}{score.dprime:>8.2f}{'no':>7}"
+                            f"{'-':>9}{'-':>10}{'-':>8}"
+                        )
+                    else:
+                        print(
+                            f"    {score.name:<17}{score.dprime:>8.2f}{'YES':>7}"
+                            f"{result.press:>9.3f}{result.release:>10.3f}"
+                            f"{result.margin:>8.3f}"
+                        )
 
                 if args.metric:
-                    picked = next(s for s in scores if s.name == args.metric)
-                    if not picked.usable:
-                        print(f"    !! forced metric {args.metric!r} does not separate")
+                    match = [p for p in evaluated if p[0].name == args.metric]
+                    if not match or match[0][1] is None:
+                        print(f"    !! forced metric {args.metric!r} has no clean threshold")
                         continue
+                    picked_score, picked_result = match[0]
                 else:
-                    usable = [s for s in scores if s.usable]
-                    if not usable:
+                    picked_score, picked_result = evaluated[0]
+                    if picked_result is None:
                         print(
-                            f"    !! {finger}: NO metric separates rest from press. "
+                            f"    !! {finger}: no metric gives a clean threshold. "
                             "See the note printed at the end."
                         )
                         continue
-                    picked = usable[0]
 
-                press_threshold, release_threshold = picked.thresholds()
                 print(
-                    f"    -> using '{picked.name}': "
-                    f"press > {press_threshold:.2f}, release < {release_threshold:.2f}"
+                    f"\n    -> '{picked_score.name}': press > {picked_result.press:.3f}, "
+                    f"release < {picked_result.release:.3f}   "
+                    f"({picked_result.detected_presses}/{picked_result.total_presses} "
+                    f"presses caught, {picked_result.false_clicks} false clicks)"
                 )
-                chosen[finger] = (picked.name, press_threshold, release_threshold)
+                chosen[finger] = (
+                    picked_score.name,
+                    picked_result.press,
+                    picked_result.release,
+                )
     except KeyboardInterrupt:
         print("\nAborted.")
         return 1

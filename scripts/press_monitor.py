@@ -66,10 +66,12 @@ class MetricRow:
     inflate the estimate.
     """
 
-    def __init__(self, finger: str, metric: str, time_constant: float) -> None:
+    def __init__(
+        self, finger: str, metric: str, time_constant: float, signal_tc: float
+    ) -> None:
         self.finger = finger
         self.metric = metric
-        self.tracker = BaselineTracker(time_constant)
+        self.tracker = BaselineTracker(time_constant, signal_tc)
         self.raw = 0.0
         self.deviation = 0.0
         self.peak_z = 0.0
@@ -194,7 +196,7 @@ def main() -> int:
     )
     fingers = [f.strip() for f in args.fingers.split(",") if f.strip()]
     rows = [
-        MetricRow(finger, metric, time_constant)
+        MetricRow(finger, metric, time_constant, settings.gestures.signal_time_constant)
         for finger in fingers
         for metric in PRESS_METRIC_NAMES
     ]
