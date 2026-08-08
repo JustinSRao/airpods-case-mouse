@@ -57,10 +57,9 @@ from src.mouse.mouse_controller import (
 from src.tracking.hand_features import (
     ANCHOR_STRATEGY_NAMES,
     compute_anchor,
-    finger_flexion,
-    fingertip_drop,
     hand_scale,
     palm_width,
+    press_metric,
 )
 from src.tracking.hand_tracker import (
     SELECTION_MODES,
@@ -163,11 +162,15 @@ class AirPodsMouseApp:
             except ValueError as exc:
                 # An uncalibrated or inverted pair would otherwise click wildly.
                 log.error("%s -- %s clicking disabled", exc, finger)
-        log.info(
-            "Finger clicking enabled for: %s (metric=%s)",
-            ", ".join(detectors) or "nothing",
-            gestures.metric,
-        )
+        for finger in detectors:
+            log.info(
+                "Clicking: %s -> %s (metric=%s, press>%.2f release<%.2f)",
+                finger,
+                detectors[finger][1].label,
+                getattr(gestures, f"{finger}_metric"),
+                detectors[finger][0].thresholds.press,
+                detectors[finger][0].thresholds.release,
+            )
         return detectors
 
     def _initial_anchor_index(self) -> int:
@@ -383,14 +386,8 @@ class AirPodsMouseApp:
             self._set_status("filter reset")
 
     def _press_metric(self, hand, finger: str) -> float:
-        metric = self._settings.gestures.metric
-        if metric == "flexion":
-            return finger_flexion(hand.world_landmarks, finger)
-        if metric == "drop":
-            return fingertip_drop(hand.world_landmarks, finger)
-        raise ValueError(
-            f"Unknown gesture metric {metric!r}; expected 'flexion' or 'drop'"
-        )
+        metric = getattr(self._settings.gestures, f"{finger}_metric")
+        return press_metric(hand.world_landmarks, finger, metric)
 
     def _update_presses(self, hand, now: float) -> None:
         """Feed each detector and translate its events into mouse buttons."""

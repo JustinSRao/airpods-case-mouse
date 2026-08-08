@@ -143,10 +143,12 @@ class GestureSettings:
 
     enabled: bool = False
 
-    # Which scalar drives the state machine:
-    #   "flexion" - total PIP+DIP bend in degrees (rises as the finger curls)
-    #   "drop"    - fingertip distance from the palm plane, in hand spans
-    metric: str = "flexion"
+    # Which scalar drives each finger's state machine. Chosen per finger by
+    # the calibrator, which measures every candidate and keeps whichever
+    # actually separates rest from press -- the winner is not the same for
+    # every hand, finger or camera angle. See PRESS_METRICS in hand_features.
+    index_metric: str = "total_flexion"
+    middle_metric: str = "total_flexion"
 
     # Units depend on ``metric``; both are written by the calibrator.
     # press must exceed release -- the gap is the hysteresis band.

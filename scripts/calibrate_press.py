@@ -1,17 +1,21 @@
-"""Measure your index/middle press and write thresholds to config/config.json.
+"""Measure your press and write per-finger metric + thresholds to config.json.
 
     .\\.venv\\Scripts\\python.exe -m scripts.calibrate_press
 
 Never sends mouse input -- it only records. Two phases per finger:
 
-  1. REST   -- hand on the case, fingers relaxed. Captures your natural
-               resting geometry, which is often already quite curled.
-  2. PRESS  -- press and hold, release, repeat. Captures how far the metric
-               actually travels when you mean it.
+  1. REST        -- hand on the case, finger relaxed, do not press.
+  2. PRESS+HOLD  -- press the finger down and HOLD it for the whole phase.
 
-Thresholds are then placed inside the gap between those two distributions,
-biased high so that a stray click (which lands on whatever is under the
-cursor) is much less likely than a missed press (which you just repeat).
+Holding matters. An earlier version asked for repeated press-and-release,
+which meant the "press" samples contained released frames too, so the two
+distributions overlapped by construction and no threshold could ever be
+found.
+
+Every candidate metric is recorded on the same frames and ranked by how
+cleanly it separates the two phases. There is no reason to assume the same
+metric wins for every finger or camera angle, so the winner is chosen per
+finger from the data.
 """
 
 from __future__ import annotations
@@ -23,43 +27,44 @@ import statistics
 import time
 
 import cv2
-import numpy as np
 
 from src.camera.camera_manager import CameraManager
 from src.config.settings import USER_CONFIG_PATH, AppSettings
-from src.tracking.hand_features import finger_flexion, fingertip_drop
+from src.tracking.hand_features import PRESS_METRIC_NAMES, press_metric
 from src.tracking.hand_tracker import HandTracker
 
 log = logging.getLogger("calibrate")
 
-# Where in the rest->press gap each threshold sits. Press is placed well above
-# the midpoint so ordinary resting jitter cannot reach it; release sits lower,
-# and the space between them is the hysteresis band.
+# Where in the rest->press gap each threshold sits. Press sits above the
+# midpoint so ordinary resting jitter cannot reach it; the space down to
+# release is the hysteresis band.
 PRESS_FRACTION = 0.55
 RELEASE_FRACTION = 0.30
+
+# Tail percentiles used for the separation test. Comparing the extremes that
+# face each other is what guarantees the states do not overlap in practice.
+REST_TAIL = 0.95
+PRESS_TAIL = 0.05
 
 _FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
-def metric_value(hand, metric: str, finger: str) -> float:
-    if metric == "flexion":
-        return finger_flexion(hand.world_landmarks, finger)
-    if metric == "drop":
-        return fingertip_drop(hand.world_landmarks, finger)
-    raise ValueError(f"Unknown metric {metric!r}; expected 'flexion' or 'drop'")
+def percentile(ordered: list[float], fraction: float) -> float:
+    index = min(int(len(ordered) * fraction), len(ordered) - 1)
+    return ordered[index]
 
 
 def collect(
     camera: CameraManager,
     tracker: HandTracker,
     prompt: str,
+    subtitle: str,
     seconds: float,
-    metric: str,
     finger: str,
     start_time: float,
-) -> list[float]:
-    """Show a prompt and record metric samples for a fixed duration."""
-    samples: list[float] = []
+) -> dict[str, list[float]]:
+    """Record every candidate metric for a fixed duration."""
+    samples: dict[str, list[float]] = {name: [] for name in PRESS_METRIC_NAMES}
     deadline = time.perf_counter() + seconds
 
     while True:
@@ -70,23 +75,32 @@ def collect(
         if frame is None:
             continue
 
-        timestamp_ms = int((time.perf_counter() - start_time) * 1000)
-        hand = tracker.select_hand(tracker.process(frame, timestamp_ms))
-
-        value = None
+        hand = tracker.select_hand(
+            tracker.process(frame, int((time.perf_counter() - start_time) * 1000))
+        )
         if hand is not None:
-            value = metric_value(hand, metric, finger)
-            samples.append(value)
+            for name in PRESS_METRIC_NAMES:
+                samples[name].append(press_metric(hand.world_landmarks, finger, name))
 
-        cv2.rectangle(frame, (0, 0), (frame.shape[1], 74), (25, 25, 25), -1)
+        count = len(samples[PRESS_METRIC_NAMES[0]])
+        cv2.rectangle(frame, (0, 0), (frame.shape[1], 96), (25, 25, 25), -1)
         cv2.putText(frame, prompt, (10, 26), _FONT, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(frame, subtitle, (10, 52), _FONT, 0.5, (0, 190, 255), 1, cv2.LINE_AA)
         status = (
-            f"{remaining:4.1f}s   samples {len(samples):4d}   value {value:8.2f}"
-            if value is not None
+            f"{remaining:4.1f}s   samples {count:4d}"
+            if hand is not None
             else f"{remaining:4.1f}s   NO HAND DETECTED"
         )
-        colour = (80, 220, 100) if value is not None else (60, 60, 240)
-        cv2.putText(frame, status, (10, 58), _FONT, 0.55, colour, 1, cv2.LINE_AA)
+        cv2.putText(
+            frame,
+            status,
+            (10, 80),
+            _FONT,
+            0.55,
+            (80, 220, 100) if hand is not None else (60, 60, 240),
+            1,
+            cv2.LINE_AA,
+        )
         cv2.imshow("Calibration", frame)
         if cv2.waitKey(1) & 0xFF == 27:
             raise KeyboardInterrupt
@@ -95,7 +109,6 @@ def collect(
 
 
 def countdown(camera: CameraManager, message: str, seconds: float = 3.0) -> None:
-    """Give the user time to get into position between phases."""
     deadline = time.perf_counter() + seconds
     while True:
         remaining = deadline - time.perf_counter()
@@ -104,14 +117,14 @@ def countdown(camera: CameraManager, message: str, seconds: float = 3.0) -> None
         frame = camera.read()
         if frame is None:
             continue
-        cv2.rectangle(frame, (0, 0), (frame.shape[1], 74), (25, 25, 25), -1)
-        cv2.putText(frame, message, (10, 26), _FONT, 0.6, (0, 190, 255), 2, cv2.LINE_AA)
+        cv2.rectangle(frame, (0, 0), (frame.shape[1], 96), (25, 25, 25), -1)
+        cv2.putText(frame, message, (10, 30), _FONT, 0.6, (0, 190, 255), 2, cv2.LINE_AA)
         cv2.putText(
             frame,
             f"starting in {remaining:.0f}...",
-            (10, 58),
+            (10, 68),
             _FONT,
-            0.55,
+            0.6,
             (255, 255, 255),
             1,
             cv2.LINE_AA,
@@ -121,81 +134,74 @@ def countdown(camera: CameraManager, message: str, seconds: float = 3.0) -> None
             raise KeyboardInterrupt
 
 
-def summarise(name: str, samples: list[float]) -> dict[str, float]:
-    ordered = sorted(samples)
-    return {
-        "n": len(ordered),
-        "min": ordered[0],
-        "p05": ordered[int(len(ordered) * 0.05)],
-        "median": statistics.median(ordered),
-        "p95": ordered[min(int(len(ordered) * 0.95), len(ordered) - 1)],
-        "max": ordered[-1],
-    }
+class MetricScore:
+    """How well one metric separated rest from press."""
 
+    def __init__(self, name: str, rest: list[float], press: list[float]) -> None:
+        self.name = name
+        rest_sorted = sorted(rest)
+        press_sorted = sorted(press)
 
-def derive_thresholds(
-    rest: list[float], press: list[float], finger: str
-) -> tuple[float, float] | None:
-    """Place press/release inside the gap between the two distributions."""
-    rest_stats = summarise("rest", rest)
-    press_stats = summarise("press", press)
+        self.rest_median = statistics.median(rest_sorted)
+        self.press_median = statistics.median(press_sorted)
+        self.rest_tail = percentile(rest_sorted, REST_TAIL)
+        self.press_tail = percentile(press_sorted, PRESS_TAIL)
+        self.gap = self.press_tail - self.rest_tail
 
-    # Use the tails that face each other: the highest resting values and the
-    # lowest pressing values. If those overlap, the metric cannot separate the
-    # two states and no threshold will work.
-    rest_high = rest_stats["p95"]
-    press_low = press_stats["p05"]
-
-    print(f"\n  {finger} REST : " + "  ".join(
-        f"{k}={v:.2f}" for k, v in rest_stats.items() if k != "n"
-    ))
-    print(f"  {finger} PRESS: " + "  ".join(
-        f"{k}={v:.2f}" for k, v in press_stats.items() if k != "n"
-    ))
-    print(f"  separation: rest p95 = {rest_high:.2f} -> press p05 = {press_low:.2f}")
-
-    gap = press_low - rest_high
-    if gap <= 0:
-        print(
-            f"  !! {finger}: rest and press OVERLAP (gap {gap:.2f}). "
-            "No threshold can separate them."
+        # d-prime: separation in units of pooled spread. Scale-free, so metrics
+        # measured in degrees and in dimensionless ratios can be compared.
+        rest_var = statistics.pvariance(rest_sorted) if len(rest_sorted) > 1 else 0.0
+        press_var = statistics.pvariance(press_sorted) if len(press_sorted) > 1 else 0.0
+        pooled = ((rest_var + press_var) / 2.0) ** 0.5
+        self.dprime = (
+            (self.press_median - self.rest_median) / pooled if pooled > 1e-12 else 0.0
         )
-        return None
 
-    press_threshold = rest_high + gap * PRESS_FRACTION
-    release_threshold = rest_high + gap * RELEASE_FRACTION
-    print(
-        f"  -> press > {press_threshold:.2f}, release < {release_threshold:.2f} "
-        f"(gap {gap:.2f})"
-    )
-    return press_threshold, release_threshold
+        # Normalise the gap by spread too, so it is comparable across metrics.
+        self.normalised_gap = self.gap / pooled if pooled > 1e-12 else 0.0
+
+    @property
+    def usable(self) -> bool:
+        """Press must sit above rest AND the facing tails must not overlap."""
+        return self.gap > 0 and self.dprime > 0
+
+    def thresholds(self) -> tuple[float, float]:
+        return (
+            self.rest_tail + self.gap * PRESS_FRACTION,
+            self.rest_tail + self.gap * RELEASE_FRACTION,
+        )
+
+    def row(self) -> str:
+        flag = "ok " if self.usable else "OVERLAP"
+        return (
+            f"    {self.name:<14} rest~{self.rest_median:8.2f}  "
+            f"press~{self.press_median:8.2f}  gap={self.gap:8.2f}  "
+            f"d'={self.dprime:6.2f}  {flag}"
+        )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--metric", default=None, help="flexion | drop")
     parser.add_argument("--rest-seconds", type=float, default=5.0)
-    parser.add_argument("--press-seconds", type=float, default=8.0)
+    parser.add_argument("--press-seconds", type=float, default=5.0)
+    parser.add_argument("--fingers", default="index,middle")
+    parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
-        "--fingers",
-        default="index,middle",
-        help="Comma-separated fingers to calibrate.",
-    )
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Measure but do not write config."
+        "--metric",
+        default=None,
+        help="Force a specific metric instead of picking the best one.",
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(levelname)-7s | %(message)s")
+    logging.basicConfig(level=logging.WARNING, format="%(levelname)-7s | %(message)s")
 
     settings = AppSettings.load()
-    metric = args.metric or settings.gestures.metric
     fingers = [f.strip() for f in args.fingers.split(",") if f.strip()]
 
-    print(f"\nCalibrating {', '.join(fingers)} using metric '{metric}'.")
+    print(f"\nCalibrating: {', '.join(fingers)}")
     print("Sit exactly as you will when using the mouse. ESC aborts.\n")
 
-    results: dict[str, tuple[float, float]] = {}
+    chosen: dict[str, tuple[str, float, float]] = {}
 
     try:
         with (
@@ -204,54 +210,82 @@ def main() -> int:
         ):
             start_time = time.perf_counter()
             for finger in fingers:
-                countdown(camera, f"[{finger}] REST - hand on case, relaxed")
+                countdown(camera, f"[{finger}]  REST - relax, do NOT press")
                 rest = collect(
                     camera,
                     tracker,
-                    f"[{finger}] REST - do NOT press",
+                    f"[{finger}]  REST",
+                    "relax the finger, do NOT press",
                     args.rest_seconds,
-                    metric,
                     finger,
                     start_time,
                 )
 
-                countdown(
-                    camera, f"[{finger}] PRESS - press and release repeatedly"
-                )
+                countdown(camera, f"[{finger}]  PRESS - hold it DOWN the whole time")
                 press = collect(
                     camera,
                     tracker,
-                    f"[{finger}] PRESS and release, over and over",
+                    f"[{finger}]  PRESS and HOLD",
+                    "keep it pressed for the whole phase",
                     args.press_seconds,
-                    metric,
                     finger,
                     start_time,
                 )
 
-                if len(rest) < 20 or len(press) < 20:
-                    print(
-                        f"  !! {finger}: not enough samples "
-                        f"(rest {len(rest)}, press {len(press)}). "
-                        "Was your hand tracked the whole time?"
-                    )
+                n_rest = len(rest[PRESS_METRIC_NAMES[0]])
+                n_press = len(press[PRESS_METRIC_NAMES[0]])
+                print(f"\n  {finger}: {n_rest} rest samples, {n_press} press samples")
+                if n_rest < 20 or n_press < 20:
+                    print("    !! too few samples - was the hand tracked throughout?")
                     continue
 
-                derived = derive_thresholds(rest, press, finger)
-                if derived is not None:
-                    results[finger] = derived
+                scores = [
+                    MetricScore(name, rest[name], press[name])
+                    for name in PRESS_METRIC_NAMES
+                ]
+                scores.sort(key=lambda s: s.normalised_gap, reverse=True)
+                for score in scores:
+                    print(score.row())
+
+                if args.metric:
+                    picked = next(s for s in scores if s.name == args.metric)
+                    if not picked.usable:
+                        print(f"    !! forced metric {args.metric!r} does not separate")
+                        continue
+                else:
+                    usable = [s for s in scores if s.usable]
+                    if not usable:
+                        print(
+                            f"    !! {finger}: NO metric separates rest from press. "
+                            "See the note printed at the end."
+                        )
+                        continue
+                    picked = usable[0]
+
+                press_threshold, release_threshold = picked.thresholds()
+                print(
+                    f"    -> using '{picked.name}': "
+                    f"press > {press_threshold:.2f}, release < {release_threshold:.2f}"
+                )
+                chosen[finger] = (picked.name, press_threshold, release_threshold)
     except KeyboardInterrupt:
         print("\nAborted.")
         return 1
     finally:
         cv2.destroyAllWindows()
 
-    if not results:
-        print("\nNothing calibrated. Nothing written.")
+    if not chosen:
+        print(
+            "\nNothing calibrated, nothing written.\n"
+            "If every metric overlapped, the press is not mechanically visible\n"
+            "to the camera. Usually one of:\n"
+            "  - the finger barely moves; try an exaggerated press to confirm\n"
+            "    the pipeline works, then reduce\n"
+            "  - the hand is too far away (want palm width 80-110 px)\n"
+            "  - the camera cannot see the finger bend; tilt the screen so the\n"
+            "    fingers are more side-on rather than straight end-on\n"
+        )
         return 1
-
-    if args.dry_run:
-        print("\n--dry-run: config not written.")
-        return 0
 
     existing: dict = {}
     if USER_CONFIG_PATH.is_file():
@@ -259,12 +293,11 @@ def main() -> int:
             existing = json.load(fh)
 
     gestures = existing.setdefault("gestures", {})
-    gestures["metric"] = metric
-    for finger, (press_threshold, release_threshold) in results.items():
+    for finger, (metric, press_threshold, release_threshold) in chosen.items():
+        gestures[f"{finger}_metric"] = metric
         gestures[f"{finger}_press_threshold"] = round(press_threshold, 3)
         gestures[f"{finger}_release_threshold"] = round(release_threshold, 3)
-    # Only enable clicking once every requested finger actually separated.
-    gestures["enabled"] = len(results) == len(fingers)
+    gestures["enabled"] = len(chosen) == len(fingers)
 
     USER_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with USER_CONFIG_PATH.open("w", encoding="utf-8") as fh:
@@ -273,6 +306,9 @@ def main() -> int:
 
     print(f"\nWrote {USER_CONFIG_PATH}")
     print(f"clicking enabled: {gestures['enabled']}")
+    if not gestures["enabled"]:
+        missing = sorted(set(fingers) - set(chosen))
+        print(f"  (still uncalibrated: {', '.join(missing)})")
     return 0
 
 

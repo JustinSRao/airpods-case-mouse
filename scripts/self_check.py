@@ -267,7 +267,12 @@ from src.gestures.finger_state import (  # noqa: E402
     PressState,
     PressThresholds,
 )
-from src.tracking.hand_features import finger_flexion, fingertip_drop  # noqa: E402
+from src.tracking.hand_features import (  # noqa: E402
+    PRESS_METRIC_NAMES,
+    finger_flexion,
+    fingertip_drop,
+    press_metric,
+)
 
 THRESHOLDS = PressThresholds(press=40.0, release=25.0, min_state_duration=0.05)
 
@@ -379,6 +384,39 @@ check(
     "fingertip drop is translation invariant",
     abs(fingertip_drop(curled, "index") - fingertip_drop(shifted, "index")) < 1e-3,
 )
+
+# Every registered metric must be translation invariant, or sliding the case
+# would register as a click. This is the property the whole design rests on,
+# so it is asserted for all of them rather than the two written by hand.
+for name in PRESS_METRIC_NAMES:
+    here = press_metric(curled, "index", name)
+    there = press_metric(shifted, "index", name)
+    check(
+        f"metric '{name}' is translation invariant",
+        abs(here - there) < 1e-3,
+        f"{here:.4f} vs {there:.4f}",
+    )
+
+# ...and scale invariant, so leaning closer to the camera is not a click.
+scaled = curled * 1.8
+for name in PRESS_METRIC_NAMES:
+    here = press_metric(curled, "index", name)
+    there = press_metric(scaled, "index", name)
+    check(
+        f"metric '{name}' is scale invariant",
+        abs(here - there) < 1e-2,
+        f"{here:.4f} vs {there:.4f}",
+    )
+
+check("all metrics report higher when curled",
+      press_metric(curled, "index", "total_flexion")
+      > press_metric(straight, "index", "total_flexion"))
+
+try:
+    press_metric(curled, "index", "nonsense")
+    check("unknown metric rejected", False, "no error")
+except ValueError:
+    check("unknown metric rejected", True)
 
 print("\n[8] multi-press toggle (P x5 within 5s)")
 from src.hotkeys import MultiPressDetector  # noqa: E402

@@ -8,6 +8,7 @@ sensitivity value keep working when the screen angle changes slightly.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from enum import IntEnum
 
 import numpy as np
@@ -159,6 +160,45 @@ def finger_flexion(world_landmarks: np.ndarray, finger: str) -> float:
     return (180.0 - pip_angle) + (180.0 - dip_angle)
 
 
+def finger_mcp_flexion(world_landmarks: np.ndarray, finger: str) -> float:
+    """Bend at the knuckle: 0 straight, larger as the finger rotates down.
+
+    Pressing a button while the hand rests on it is mostly an MCP rotation --
+    the whole finger pivots at the knuckle rather than curling. PIP/DIP curl
+    can barely register that, which is why this is measured separately.
+    """
+    mcp, pip, _, _ = FINGER_JOINTS[finger]
+    return 180.0 - _joint_angle(
+        world_landmarks[Landmark.WRIST], world_landmarks[mcp], world_landmarks[pip]
+    )
+
+
+def finger_total_flexion(world_landmarks: np.ndarray, finger: str) -> float:
+    """MCP + PIP + DIP bend, in degrees. Catches a press however it is made."""
+    return finger_mcp_flexion(world_landmarks, finger) + finger_flexion(
+        world_landmarks, finger
+    )
+
+
+def finger_curl_ratio(world_landmarks: np.ndarray, finger: str) -> float:
+    """How much the finger falls short of straight, as a fraction of itself.
+
+    ``1 - (MCP-to-tip straight line) / (sum of the bone lengths)``. Zero for a
+    perfectly straight finger, rising as it curls. Dimensionless, so unlike
+    the angle metrics it needs no scale reference at all.
+    """
+    mcp, pip, dip, tip = FINGER_JOINTS[finger]
+    chord = float(np.linalg.norm(world_landmarks[tip] - world_landmarks[mcp]))
+    bones = (
+        float(np.linalg.norm(world_landmarks[pip] - world_landmarks[mcp]))
+        + float(np.linalg.norm(world_landmarks[dip] - world_landmarks[pip]))
+        + float(np.linalg.norm(world_landmarks[tip] - world_landmarks[dip]))
+    )
+    if bones < 1e-9:
+        return 0.0
+    return 1.0 - chord / bones
+
+
 def palm_normal(world_landmarks: np.ndarray) -> np.ndarray:
     """Unit vector perpendicular to the plane of the palm."""
     wrist = world_landmarks[Landmark.WRIST]
@@ -192,6 +232,32 @@ def fingertip_drop(world_landmarks: np.ndarray, finger: str) -> float:
     return float(np.dot(offset, palm_normal(world_landmarks))) / world_hand_span(
         world_landmarks
     )
+
+
+# Every candidate press metric, all defined so that a HIGHER value means
+# "more pressed". The calibrator measures all of them at once and picks
+# whichever actually separates rest from press on this hand -- there is no
+# reason to assume the same one wins for every finger or every camera angle.
+PRESS_METRICS: dict[str, "Callable[[np.ndarray, str], float]"] = {
+    "flexion": finger_flexion,
+    "mcp_flexion": finger_mcp_flexion,
+    "total_flexion": finger_total_flexion,
+    "curl_ratio": finger_curl_ratio,
+    "drop": fingertip_drop,
+}
+
+PRESS_METRIC_NAMES = tuple(PRESS_METRICS)
+
+
+def press_metric(world_landmarks: np.ndarray, finger: str, metric: str) -> float:
+    """Evaluate one named press metric."""
+    try:
+        fn = PRESS_METRICS[metric]
+    except KeyError:
+        raise ValueError(
+            f"Unknown press metric {metric!r}; expected one of {PRESS_METRIC_NAMES}"
+        ) from None
+    return fn(world_landmarks, finger)
 
 
 def fingertip_relative_to_palm(
